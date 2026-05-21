@@ -131,30 +131,51 @@ async function runPython(id, code) {
 /// Render every open matplotlib figure to a PNG and print it with the
 /// `terrarium_show` marker so the runner's View tab picks them up.
 /// No-op if matplotlib was never imported in this run.
+///
+/// We render through `FigureCanvasAgg` directly instead of relying on
+/// `Figure.savefig`. Pyodide ships matplotlib with the
+/// `module://matplotlib_pyodide.html5_canvas_backend` backend by default,
+/// and that backend's canvas needs a real `<canvas>` element in the DOM —
+/// which we don't have, since the WKWebView is headless. Going through
+/// Agg directly sidesteps the active backend entirely and produces a
+/// PNG every time `plt.plot(...)` created a figure, regardless of
+/// whether the user called `plt.show()`.
 async function autoShowMatplotlibFigures() {
   try {
     await pyodide.runPythonAsync(`
 import sys as _sys
 if 'matplotlib' in _sys.modules or 'matplotlib.pyplot' in _sys.modules:
+    _errs = []
     try:
         import matplotlib.pyplot as _plt
+        from matplotlib.backends.backend_agg import FigureCanvasAgg as _AggCanvas
         import io as _io, base64 as _b64
-        for _num in _plt.get_fignums():
-            _fig = _plt.figure(_num)
-            _buf = _io.BytesIO()
-            _fig.savefig(_buf, format='png', bbox_inches='tight', dpi=120)
-            _buf.seek(0)
-            _encoded = _b64.b64encode(_buf.read()).decode('ascii')
-            print(f"__TERRARIUM_IMG_PNG_B64__:{_encoded}")
+        _nums = list(_plt.get_fignums())
+        for _num in _nums:
+            try:
+                _fig = _plt.figure(_num)
+                _canvas = _AggCanvas(_fig)
+                _buf = _io.BytesIO()
+                _canvas.print_png(_buf)
+                _buf.seek(0)
+                _encoded = _b64.b64encode(_buf.read()).decode('ascii')
+                print(f"__TERRARIUM_IMG_PNG_B64__:{_encoded}")
+            except Exception as _fe:
+                _errs.append(f"figure {_num}: {_fe!r}")
         _plt.close('all')
     except Exception as _e:
-        # Don't let auto-show ever crash the user's run — they didn't
-        # ask for this behavior, so they shouldn't pay for it failing.
+        _errs.append(repr(_e))
+    if _errs:
+        # Surface to stderr so the user sees WHY their plot didn't show.
+        # The runner's Console tab pipes stderr in red.
         import sys as __sys
-        print(f"(auto-show skipped: {_e})", file=__sys.stderr)
+        for _msg in _errs:
+            print(f"[terrarium] auto-show failed — {_msg}", file=__sys.stderr)
 `);
-  } catch (_) {
-    // Same defensive principle on the JS side.
+  } catch (jsErr) {
+    // Last-resort JS-side catch. Surface to stderrBuf so the Swift side
+    // sees something other than silence when this path explodes.
+    stderrBuf += "[terrarium] auto-show JS error: " + String(jsErr) + "\n";
   }
 }
 
