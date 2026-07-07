@@ -224,10 +224,10 @@ public struct PythonCodeRunnerSheet: View {
                         .foregroundColor(.secondary)
                     Text("import terrarium_show")
                         .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(.accentColor)
+                        .foregroundColor(.primary)
                     Text("terrarium_show.show(fig)")
                         .font(.system(.caption, design: .monospaced))
-                        .foregroundColor(.accentColor)
+                        .foregroundColor(.primary)
                 }
                 .padding(.top, 4)
             }

@@ -67,6 +67,7 @@ public struct PythonPackageManagerView: View {
                     } label: {
                         Image(systemName: "plus")
                     }
+                    .tint(.primary)
                 }
             }
             .searchable(text: $searchText, prompt: "Search packages")
@@ -82,6 +83,7 @@ public struct PythonPackageManagerView: View {
                     Text(error)
                 }
             }
+            .tint(.primary)
             .onAppear {
                 loadPyodidePackages()
             }
@@ -314,6 +316,7 @@ public struct PythonPackageManagerView: View {
                     Button("Cancel") {
                         showingInstallSheet = false
                     }
+                    .tint(.primary)
                 }
             }
         }

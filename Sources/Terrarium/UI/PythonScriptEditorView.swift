@@ -93,6 +93,7 @@ public struct PythonScriptEditorView: View {
                     Button("Cancel") {
                         dismiss()
                     }
+                    .tint(.primary)
                 }
 
                 ToolbarItem(placement: .confirmationAction) {
@@ -100,6 +101,7 @@ public struct PythonScriptEditorView: View {
                         saveScript()
                     }
                     .disabled(name.isEmpty || code.isEmpty)
+                    .tint(.primary)
                 }
             }
             .onAppear {
@@ -119,6 +121,7 @@ public struct PythonScriptEditorView: View {
                     Text(error)
                 }
             }
+            .tint(.primary)
         }
     }
 
@@ -191,6 +194,7 @@ public struct PythonScriptEditorView: View {
                     addTag()
                 }
                 .disabled(newTag.isEmpty)
+                .tint(.primary)
             }
         }
     }
@@ -222,6 +226,7 @@ public struct PythonScriptEditorView: View {
                     showingOutput = true
                 }
                 .font(.caption)
+                .tint(.primary)
             }
         }
         .padding(.vertical, 4)
@@ -400,6 +405,7 @@ public struct PythonOutputView: View {
                     Button("Done") {
                         dismiss()
                     }
+                    .tint(.primary)
                 }
 
                 ToolbarItem(placement: .primaryAction) {
@@ -408,6 +414,7 @@ public struct PythonOutputView: View {
                     } label: {
                         Image(systemName: "doc.on.doc")
                     }
+                    .tint(.primary)
                 }
             }
         }
