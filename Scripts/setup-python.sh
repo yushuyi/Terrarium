@@ -44,6 +44,12 @@ else
     exit 1
 fi
 
+# BeeWare's tarball no longer ships the build helpers the app's
+# "Wrap Python Extensions" build phase sources (utils.sh wraps raw .so
+# files into signable .frameworks). Install our vendored copies.
+mkdir -p "$TARGET/build"
+cp "$SCRIPT_DIR/python-build-support/"* "$TARGET/build/"
+
 echo "setup-python: done. $(du -sh "$TARGET" | cut -f1) at $TARGET"
 echo
 echo "Next steps:"
