@@ -85,11 +85,30 @@ public final class PyodideBridge: NSObject, ObservableObject {
         prefs.allowsContentJavaScript = true
         config.defaultWebpagePreferences = prefs
 
-        webView = WKWebView(frame: .zero, configuration: config)
-        // Never attached to a UIWindow. WKWebView still loads + runs JS
-        // perfectly fine off-screen as long as the instance is retained.
+        webView = WKWebView(frame: CGRect(x: -1, y: -1, width: 1, height: 1), configuration: config)
+        // 必须挂到 window：WebKit 对不属于可见窗口的 WebContent 进程只持
+        // 后台级断言，iOS 会随时冻结该进程（JS 一进异步等待就冻），
+        // 表现为 runResult 永不返回。1x1 + 近零 alpha + 禁触摸，用户不可见。
+        ensureWebAttached()
 
         loadHostPage()
+    }
+
+    /// 把 webview 挂到 key window（幂等）。只有 webview 处于窗口层级内，
+    /// WebKit 才为 WebContent 进程持前台断言，JS 才能持续存活。
+    private func ensureWebAttached() {
+        #if os(iOS)
+        guard webView.superview == nil else { return }
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+        guard let window = scene?.windows.first(where: { $0.isKeyWindow }) ?? scene?.windows.first else {
+            return // window 未就绪，静默跳过，下次执行前再试
+        }
+        webView.alpha = 0.01
+        webView.isUserInteractionEnabled = false
+        window.addSubview(webView)
+        #endif
     }
 
     private func loadHostPage() {
@@ -137,6 +156,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
         }
         let id = UUID().uuidString
         if let onOutput { outputHandlers[id] = onOutput }
+        ensureWebAttached() // window 就绪晚于 bridge 初始化的场景兜底
         return await withCheckedContinuation { (cont: CheckedContinuation<PyodideRunResult, Never>) in
             pendingRun[id] = cont
             let escaped = Self.jsStringLiteral(code)
