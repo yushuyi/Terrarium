@@ -10,16 +10,12 @@ Package.resolved
 # Xcode user state
 xcuserdata/
 
-# Python binary blob — must be downloaded via Scripts/setup-python.sh
-Python.xcframework/
-
-# Pyodide runtime — must be downloaded via Scripts/fetch-pyodide.sh
-Resources/pyodide-runtime/
-
-# Build & tmp
+# 构建产物与临时文件
 *.o
 *.d
 *.dia
 DerivedData/
 *.pyc
 __pycache__/
+
+# 注意：Resources/pyodide-runtime/（离线 bundle）按离线方案要求纳入版本管理，不忽略

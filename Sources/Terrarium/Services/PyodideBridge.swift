@@ -1,11 +1,10 @@
 //
 //  PyodideBridge.swift
-//  Terrarium
+//  Terrarium（fork）
 //
-//  Embeds Pyodide (CPython compiled to WebAssembly) inside a hidden
-//  WKWebView. Provides an async Swift API mirroring the existing
-//  PythonRuntimeService so the rest of Terrarium doesn't need to know
-//  which runtime is executing a given script.
+//  在隐藏 WKWebView 中嵌入 Pyodide（CPython 3.13 编译到 WebAssembly）。
+//  对外提供 async Swift API；执行走哪条通道（原生 CPython / Pyodide）
+//  由宿主 App（MianShu）的路由逻辑决定，本包不做路由。
 //
 //  Why a WebView?
 //    iOS doesn't ship a public WASM runtime usable from Swift. The most

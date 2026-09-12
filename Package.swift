@@ -1,81 +1,38 @@
 // swift-tools-version: 5.9
 //
-// Terrarium — embedded Python runtime for iOS / macOS apps.
+// Terrarium（fork）— iOS 离线 Pyodide 桥接包。
 //
-// Bundles every resource the runner needs directly inside the SwiftPM
-// product. Consumers add a single SwiftPM dependency and get the full
-// Python 3.13 interpreter, the bundled standard library, ~30 pure-Python
-// packages, the C-extension shim layer, and the Pyodide host bridge —
-// no manual Xcode folder references required.
+// 本包只保留「Pyodide 桥」：在隐藏 WKWebView 中运行 Pyodide
+// （CPython 3.13 编译到 WebAssembly），为宿主 App 提供
+// numpy / pandas / matplotlib 等 C 扩展包的执行通道。
 //
-// One-time setup before first build:
+// 原生 CPython 执行由宿主负责（MianShu 内嵌 BeeWare CPython 3.14.2）。
+// 上游自带的 Python.xcframework、python-stdlib、lib-dynload、
+// site-packages、包管理器、脚本管理器与全部 UI 已剥离。
 //
-//   ./Scripts/setup-python.sh    # downloads Python.xcframework
+// 上游：https://github.com/haplollc/Terrarium（MIT）
+// 手术记录与路由设计：MianShu 主仓 MianshuAgent/docs/Terrarium-Pyodide离线运行时-*.md
 //
-// (We can't ship the framework in git — it's a 112 MB binary blob. The
-// script pulls a pinned BeeWare release.)
 
 import PackageDescription
 
 let package = Package(
     name: "Terrarium",
     platforms: [
-        .iOS(.v17),     // ContentUnavailableView + new SwiftUI animation APIs
+        .iOS(.v17),
         .macOS(.v14)
     ],
     products: [
         .library(name: "Terrarium", targets: ["Terrarium"]),
     ],
-    dependencies: [
-        // Used by the package manager to unzip wheels downloaded from
-        // PyPI. Pure Swift, no native deps.
-        .package(url: "https://github.com/weichsel/ZIPFoundation", from: "0.9.19"),
-    ],
     targets: [
-        // CPython framework — must exist on disk before SwiftPM resolves.
-        // Run Scripts/setup-python.sh to fetch it from BeeWare's
-        // Python-Apple-support release. Gitignored.
-        .binaryTarget(
-            name: "Python",
-            path: "Python.xcframework"
-        ),
-        // Headers + module map giving Swift code access to Python's
-        // public C API.
-        .systemLibrary(
-            name: "CPython",
-            path: "Sources/CPython",
-            pkgConfig: nil,
-            providers: []
-        ),
         .target(
             name: "Terrarium",
-            dependencies: [
-                .product(name: "ZIPFoundation", package: "ZIPFoundation"),
-                "CPython",
-                "Python"
-            ],
             path: "Sources/Terrarium",
-            // Every consumer of `import Terrarium` gets these resources
-            // inside `Bundle.module` automatically. No host-app wiring
-            // required — the package is self-contained.
             resources: [
-                .copy("Resources/python-stdlib"),      // 47 MB — Python stdlib
-                .copy("Resources/site-packages"),      // 13 MB — curated pure-Python packages
-                .copy("Resources/lib-dynload"),        // 14 MB — C extension shims
-                .copy("Resources/pyodide-host"),       // tiny — Pyodide WKWebView host
-            ],
-            swiftSettings: [
-                .interoperabilityMode(.C)
-            ],
-            linkerSettings: [
-                .linkedLibrary("z"),
-                .linkedLibrary("sqlite3")
+                // Pyodide WKWebView 宿主页（host.html / host.js）
+                .copy("Resources/pyodide-host"),
             ]
-        ),
-        .testTarget(
-            name: "TerrariumTests",
-            dependencies: ["Terrarium"],
-            path: "Tests/TerrariumTests"
         ),
     ]
 )
