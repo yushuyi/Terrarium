@@ -57,7 +57,9 @@ def _proxy_fetch(method, abs_url, headers, body, timeout_s):
     """同步执行代理请求。返回 (status:int, headers:list[(k,v)], body:bytes)。"""
     from urllib.parse import quote
 
-    spec = {"method": method, "headers": headers}
+    # headers 以对象传输（Swift ProxyRequestSpec.headers 为 [String: String]）；
+    # 同名多头会合并（极少数场景，如多个 Set-Cookie，后续按需改双形态）
+    spec = {"method": method, "headers": dict(headers)}
     if timeout_s and timeout_s > 0:
         spec["timeoutMs"] = int(timeout_s * 1000)
     if body:
