@@ -94,19 +94,26 @@ public final class PyodideBridge: NSObject, ObservableObject {
         loadHostPage()
     }
 
-    /// 把 webview 挂到 key window（幂等）。只有 webview 处于窗口层级内，
-    /// WebKit 才为 WebContent 进程持前台断言，JS 才能持续存活。
+    /// 把 webview 挂到 key window（幂等）。只有 webview 处于前台场景的
+    /// 窗口层级内，WebKit 才为 WebContent 进程持前台断言，JS 才能持续存活。
     private func ensureWebAttached() {
         #if os(iOS)
-        guard webView.superview == nil else { return }
+        // 已挂在仍处于前台场景的 window 上 → 无需处理
+        if let current = webView.window,
+           current.windowScene?.activationState == .foregroundActive { return }
+        // 找不到可用目标时保留现状不强拆，避免从「旧窗」退化为「无窗」
         let scene = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
             .first { $0.activationState == .foregroundActive }
-        guard let window = scene?.windows.first(where: { $0.isKeyWindow }) ?? scene?.windows.first else {
-            return // window 未就绪，静默跳过，下次执行前再试
-        }
+        guard let window = scene?.windows.first(where: { $0.isKeyWindow }) ?? scene?.windows.first,
+              webView.superview !== window else { return }
+        webView.removeFromSuperview()
         webView.alpha = 0.01
         webView.isUserInteractionEnabled = false
+        // 无障碍屏蔽：alpha 0.01 达不到系统「视为隐藏」阈值，
+        // 不屏蔽会进入 VoiceOver 焦点序与视图转储
+        webView.isAccessibilityElement = false
+        webView.accessibilityElementsHidden = true
         window.addSubview(webView)
         #endif
     }
@@ -124,6 +131,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// Await Pyodide finishing its bootstrap (loading the WASM module,
     /// mounting IDBFS, pre-loading micropip). Safe to call repeatedly.
     public func awaitReady() async throws {
+        ensureWebAttached() // bootstrap 是冻结最高危阶段，须先确保挂窗（所有入口都经此）
         if isReady { return }
         if let err = loadError {
             throw PythonError.initializationFailed("Pyodide: \(err)")
