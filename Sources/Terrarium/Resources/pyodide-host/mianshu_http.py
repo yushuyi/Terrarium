@@ -205,6 +205,7 @@ def _make_pool_cls(base_cls, scheme):
     - https 的 connect() 置空（沙箱无 socket，TLS 由原生 URLSession 完成）
     """
     from http.client import HTTPConnection as _BaseHTTPConnection
+    from http.client import HTTPSConnection as _BaseHTTPSConnection
 
     class _MSConnection(base_cls):
         def getresponse(self):
@@ -214,8 +215,10 @@ def _make_pool_cls(base_cls, scheme):
                 raise ResponseNotReady()
             resp_options = self._response_options
             self._response_options = None
-            # 显式调 http.client 基类补丁版（返回 stdlib HTTPResponse）
-            httplib_response = _BaseHTTPConnection.getresponse(self)
+            # 显式调 http.client 对应 scheme 的补丁版（各自闭包持有正确
+            # 的 scheme；统一走 HTTPConnection 会把 https 重建成 http）
+            base = _BaseHTTPSConnection if scheme == "https" else _BaseHTTPConnection
+            httplib_response = base.getresponse(self)
             try:
                 from urllib3._collections import HTTPHeaderDict as _HeaderDict
                 from urllib3.response import HTTPResponse as _U3Response
