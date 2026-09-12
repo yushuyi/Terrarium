@@ -48,7 +48,7 @@ pkgs = lock["packages"] if isinstance(lock["packages"], dict) else {p["name"]: p
 # 只需从 PyPI 拉 tushare 本体（纯 wheel），依赖走本地离线伺服
 targets = ["numpy", "pandas", "matplotlib", "micropip",
            "requests", "beautifulsoup4", "lxml", "tqdm",
-           "typing-extensions", "simplejson"]
+           "typing-extensions", "simplejson", "ssl"]
 need = set()
 def add(name):
     if name in need or name not in pkgs:

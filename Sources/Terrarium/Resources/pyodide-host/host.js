@@ -16,6 +16,8 @@ let stderrBuf = "";
 let progressBuf = [];
 // 当前正在执行的 runPython 调用 id——stdout/stderr 回调据此做流式转发
 let currentRunId = null;
+// 启动期警告（ssl/代理注入失败等）——首跑时经 stderr 流出，避免静默
+let bootWarnings = [];
 
 // Persistent storage path inside Pyodide's emscripten FS. We mount IDBFS
 // here so installed packages survive WebView reloads (and thus app
@@ -95,6 +97,16 @@ if _target not in sys.path:
     sys.path.insert(0, _target)
 `);
 
+    // ssl：http.client.HTTPSConnection 的依赖包。沙箱内不做真 TLS
+    // （由原生 URLSession 完成），但类结构必须存在，否则 urllib3 降级
+    // 为 DummyConnection 且 mianshu_http 注入失败
+    try {
+      await pyodide.loadPackage("ssl");
+    } catch (e) {
+      bootWarnings.push("ssl 包加载失败，https 请求将不可用");
+      console.warn("[mianshu_http] ssl 包加载失败:", e);
+    }
+
     // mianshu_http：把 http.client 改道原生网络代理（同步桥）。
     // requests/urllib/urllib3 零改动可用；Referer/CORS 限制由原生侧绕过。
     // 注入失败不阻断 bootstrap（纯标准库脚本不需要它）。
@@ -105,7 +117,8 @@ if _target not in sys.path:
       pyodide.FS.writeFile("/lib/python3.13/site-packages/mianshu_http.py", modText, { encoding: "utf8" });
       await pyodide.runPythonAsync("import mianshu_http; mianshu_http.install()");
     } catch (e) {
-      console.warn("[mianshu_http] 注入失败（联网脚本将不可用）:", e);
+      bootWarnings.push("mianshu_http 注入失败，联网脚本不可用: " + String(e && e.message || e));
+      console.warn("[mianshu_http] 注入失败:", e);
     }
 
     pyodideReady = true;
@@ -132,6 +145,12 @@ async function runPython(id, code) {
   }
   resetBuffers();
   currentRunId = id;
+  if (bootWarnings.length) {
+    for (const w of bootWarnings) {
+      post({ kind: "stderr", id, line: "[pyodide] " + w });
+    }
+    bootWarnings = [];
+  }
   const t0 = performance.now();
   let exception = null;
   let exitCode = 0;

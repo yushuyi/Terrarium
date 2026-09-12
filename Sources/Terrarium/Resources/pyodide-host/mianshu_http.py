@@ -24,9 +24,18 @@
 import base64
 import io
 import json as _json
-from http.client import HTTPConnection, HTTPSConnection, HTTPResponse
+from http.client import HTTPConnection, HTTPResponse
 
 import js
+
+try:
+    from http.client import HTTPSConnection as _StdHTTPSConnection
+except ImportError:
+    # ssl 包未加载时 http.client 不定义 HTTPSConnection；
+    # install() 会以替身类兜底（TLS 由原生 URLSession 完成）
+    _StdHTTPSConnection = None
+
+_ms_https_cls = None  # 实际生效的 https 连接类（供 urllib3 还原用）
 
 _PROXY_BASE = "pyodide-local://net?"
 
@@ -188,7 +197,12 @@ def _restore_urllib3():
         import urllib3.connectionpool as _cp
 
         _cp.HTTPConnectionPool.ConnectionCls = _cp.HTTPConnection
-        _cp.HTTPSConnectionPool.ConnectionCls = _cp.HTTPSConnection
+        if _ms_https_cls is not None:
+            # ssl 缺失时 urllib3 的 HTTPSConnection 是 DummyConnection，
+            # 不能作为连接类；换成本模块的替身
+            _cp.HTTPSConnectionPool.ConnectionCls = _ms_https_cls
+        else:
+            _cp.HTTPSConnectionPool.ConnectionCls = _cp.HTTPSConnection
     except Exception:
         pass
     # https 池 _validate_conn 会在发请求前触发真 socket 的 connect()
@@ -202,6 +216,16 @@ def _restore_urllib3():
 
 def install():
     """启用代理（幂等）。bootstrap 阶段调用一次。"""
+    global _ms_https_cls
     _install_class(HTTPConnection, "http")
-    _install_class(HTTPSConnection, "https")
+    if _StdHTTPSConnection is not None:
+        _install_class(_StdHTTPSConnection, "https")
+        _ms_https_cls = _StdHTTPSConnection
+    else:
+        class _MSHTTPSConnection(HTTPConnection):
+            """ssl 缺失时的 https 替身：TLS 由原生 URLSession 完成。"""
+            default_port = 443
+
+        _install_class(_MSHTTPSConnection, "https")
+        _ms_https_cls = _MSHTTPSConnection
     _restore_urllib3()
