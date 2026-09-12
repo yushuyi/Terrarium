@@ -5,20 +5,23 @@
 2. 浏览器网络栈丢 Referer、受 CORS 限制：新浪行情等站点拒答
 
 原理（协议级通用，不绑定任何站点）：
-- 补丁点下沉到 http.client 的五个原语 putrequest/putheader/
-  _send_output/send/getresponse。urllib3 的 HTTPConnection 覆写了
-  request()（putrequest→putheader→endheaders→send 链），不调用
-  super().request()，所以只有原语层能同时覆盖 requests/urllib/裸
-  http.client 全部路径；响应统一 JSON 信封 {"status","headers",
-  "bodyB64"}（固定 200 交付），重组为标准 HTTPResponse 返回
-- urllib3 在 emscripten 平台 import 时会自注入浏览器 XHR 连接类
-  （contrib/emscripten，受 CORS 限制），install() 时换回标准连接类
+- http.client 侧：putrequest/putheader 完全不动（保留状态机与自动头
+  语义），只拦截三个「触达 socket」的点：
+    _send_output：不发 socket，改为捕获缓冲中的请求行+请求头
+    send        ：不发 socket，只累积请求体（urllib3 分块 body 由此到达）
+    getresponse ：组代理 URL → 同步 XHR → 原生 URLSession → 响应重组为
+                  标准 HTTPResponse
+- urllib3 2.x 侧：emscripten 平台 import 时会自注入浏览器 XHR 连接类
+  （受 CORS 限制），restore 换回标准连接类；其 getresponse 含无守卫的
+  self.sock.settimeout（sock 恒为 None），以复刻版替换（去 sock 访问）
 - 等待用「同步 XMLHttpRequest」：阻塞的是 WebContent 进程主线程，
   宿主 SchemeHandler 在 App 进程交付响应，跨进程无死锁
-- 超时由宿主统一控制（60s）；重定向由 URLSession 自动跟随
+- 响应统一 JSON 信封 {"status","headers","bodyB64"}（固定 200 交付），
+  不依赖同步 XHR 的字符集行为；超时经 spec.timeoutMs 透传宿主
+  （缺省 60s）；重定向由 URLSession 自动跟随（requests 侧
+  allow_redirects=False 不生效，见实施方案已知限制）
 
-局限（v1）：异步库（httpx/aiohttp）不走 http.client，不覆盖；
-请求体经 send 累积，理论支持任意流式 body。
+局限（v1）：异步库（httpx/aiohttp）不走 http.client，不覆盖。
 """
 
 import base64
@@ -38,6 +41,7 @@ except ImportError:
 _ms_https_cls = None  # 实际生效的 https 连接类（供 urllib3 还原用）
 
 _PROXY_BASE = "pyodide-local://net?"
+_DEFAULT_TIMEOUT_S = 60.0
 
 
 def _b64url(data: bytes) -> str:
@@ -49,11 +53,13 @@ class _ProxyError(OSError):
     """代理链路错误（宿主网络失败/参数无效），区别于目标站点的 HTTP 错误。"""
 
 
-def _proxy_fetch(method, abs_url, headers, body):
+def _proxy_fetch(method, abs_url, headers, body, timeout_s):
     """同步执行代理请求。返回 (status:int, headers:list[(k,v)], body:bytes)。"""
     from urllib.parse import quote
 
     spec = {"method": method, "headers": headers}
+    if timeout_s and timeout_s > 0:
+        spec["timeoutMs"] = int(timeout_s * 1000)
     if body:
         spec["bodyB64"] = base64.b64encode(body).decode()
     query = (
@@ -87,35 +93,22 @@ class _FakeSocket:
         return self._file
 
 
+def _conn_timeout_s(self):
+    """连接对象上的超时（urllib3 会设 float；裸 http.client 可能是对象）。"""
+    t = getattr(self, "timeout", None)
+    if isinstance(t, (int, float)) and 0 < t < 3600:
+        return float(t)
+    return _DEFAULT_TIMEOUT_S
+
+
 def _install_class(cls, scheme):
-    """把 cls 的底层原语替换为代理实现。
-
-    urllib3.connection.HTTPConnection 继承自 http.client.HTTPConnection
-    且不覆写这些原语（只覆写 request/getresponse 的上层编排），因此在
-    基类打补丁即可让 requests/urllib/urllib3 全部改道。
-    """
-
-    def putrequest(self, method, url, skip_host=False, skip_accept_encoding=False):
-        self._ms_method = str(method).upper()
-        self._ms_url = url
-        self._ms_headers = []
-        self._ms_body = bytearray()
-        self._ms_headers_done = False
-        if not skip_host:
-            self.putheader("Host", self._ms_netloc())
-        if not skip_accept_encoding:
-            # 明文优先：http.client 不解压，gzip 会破坏 body 组装
-            self.putheader("Accept-Encoding", "identity")
-
-    def putheader(self, header, *values):
-        if not hasattr(self, "_ms_headers"):
-            raise ConnectionError("mianshu_http: putheader 必须先于 putrequest 调用")
-        self._ms_headers.append((str(header), ", ".join(str(v) for v in values)))
+    """拦截 cls 触达 socket 的三个点（putrequest/putheader 保持原语义）。"""
 
     def _send_output(self, message_body=None, encode_chunked=False):
-        # 原实现在此拼响应头字节流并 send——我们改为只标记头结束；
-        # message_body（http.client 自带 request 路径）在此收进 body
-        self._ms_headers_done = True
+        # 原实现在此拼头字节流并 send——我们改为捕获后等 getresponse 发代理
+        self._ms_req_lines = list(getattr(self, "_buffer", []))
+        del self._buffer[:]
+        self._ms_body = bytearray()
         if message_body is None:
             return
         if isinstance(message_body, str):
@@ -123,66 +116,121 @@ def _install_class(cls, scheme):
         elif isinstance(message_body, (bytes, bytearray)):
             self._ms_body.extend(bytes(message_body))
         else:
-            # 文件/可迭代 body：逐块读取
+            # 文件/可迭代 body：逐块读入
             while True:
-                try:
+                if hasattr(message_body, "read"):
                     chunk = message_body.read(65536)
-                except AttributeError:
-                    chunk = None
+                else:
                     try:
                         chunk = next(iter(message_body))
                     except StopIteration:
-                        pass
+                        chunk = None
                 if not chunk:
                     break
-                self.send(chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8"))
+                self._ms_body.extend(chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8"))
 
     def send(self, data):
-        # urllib3 在 endheaders 后经 send 逐块送 body；头阶段字节已由
-        # putheader 结构化保存，这里只收 body
-        if getattr(self, "_ms_headers_done", False) and data:
+        # urllib3 在 endheaders 后经 send 逐块送 body，在此累积
+        if data:
+            if not hasattr(self, "_ms_body"):
+                self._ms_body = bytearray()
             self._ms_body.extend(bytes(data))
 
     def getresponse(self):
-        method = getattr(self, "_ms_method", None)
-        if method is None:
-            raise ConnectionError("mianshu_http: getresponse 必须先于 putrequest 调用")
-        url = self._ms_url or "/"
-        if url.startswith("http://") or url.startswith("https://"):
-            abs_url = url
+        lines = getattr(self, "_ms_req_lines", None)
+        if not lines:
+            raise ConnectionError("mianshu_http: 无待发请求")
+        req_line = lines[0].decode("latin-1")
+        parts = req_line.split(" ")
+        method = parts[0].upper()
+        path = parts[1] if len(parts) > 1 else "/"
+        headers = []
+        for raw in lines[1:]:
+            line = raw.decode("latin-1").rstrip("\r\n")
+            if ": " in line:
+                key, value = line.split(": ", 1)
+                headers.append((key, value))
+
+        # 绝对 URL：优先 Host 头（原版 putrequest 已按语义生成），退回连接属性。
+        # IPv6 字面量补方括号；其余交给原生 URL 解析（IDN 由 NSURL 容错）
+        host_header = next((v for k, v in headers if k.lower() == "host"), None)
+        if host_header:
+            netloc = host_header
+        elif ":" in (self.host or "") and not (self.host or "").startswith("["):
+            netloc = f"[{self.host}]:{self.port}" if self.port not in (80, 443, None) else f"[{self.host}]"
         else:
-            abs_url = f"{scheme}://{self._ms_netloc()}{url if url.startswith('/') else '/' + url}"
+            netloc = self.host if self.port in (80, 443, None) else f"{self.host}:{self.port}"
+        if "://" in path:
+            abs_url = path
+        else:
+            abs_url = f"{scheme}://{netloc}{path if path.startswith('/') else '/' + path}"
 
         status, resp_headers, resp_body = _proxy_fetch(
-            method, abs_url, self._ms_headers, bytes(self._ms_body) or None
+            method, abs_url, headers, bytes(self._ms_body) or None, _conn_timeout_s(self)
         )
 
-        # 重组原始响应字节流，交给标准 HTTPResponse 解析
-        # （Content-Length/chunked/HEAD 无体等语义全部复用标准实现）
-        lines = [f"HTTP/1.1 {status} MS-PROXY".encode("latin-1")]
-        if not resp_headers:
-            resp_headers = [("Content-Length", "0")]
+        # 重组原始响应字节流，交给标准 HTTPResponse 解析。响应头已由宿主
+        # 剔除 Transfer-Encoding / 失真的 Content-Length / Content-Encoding
+        # （body 恒为解 chunk、未透明解压的原始字节），无头时读至 EOF。
+        out_lines = [f"HTTP/1.1 {status} MS-PROXY".encode("latin-1")]
         for key, value in resp_headers:
             try:
-                lines.append(f"{key}: {value}".encode("latin-1"))
+                out_lines.append(f"{key}: {value}".encode("latin-1"))
             except UnicodeEncodeError:
-                lines.append(f"{key}: ".encode("latin-1") + value.encode("utf-8", "replace"))
-        raw = b"\r\n".join(lines) + b"\r\n\r\n" + resp_body
+                out_lines.append(f"{key}: ".encode("latin-1") + value.encode("utf-8", "replace"))
+        raw = b"\r\n".join(out_lines) + b"\r\n\r\n" + resp_body
 
         resp = HTTPResponse(_FakeSocket(raw), method=method)
         resp.begin()
         return resp
 
-    cls.putrequest = putrequest
-    cls.putheader = putheader
     cls._send_output = _send_output
     cls.send = send
     cls.getresponse = getresponse
-    cls._ms_netloc = lambda self: (
-        self.host
-        if self.port in (80, 443, None)
-        else f"{self.host}:{self.port}"
-    )
+
+
+def _patch_urllib3_connection_cls():
+    """urllib3 2.x 的 HTTPConnection.getresponse 含无守卫的
+    self.sock.settimeout（沙箱内 sock 恒为 None，必炸 AttributeError）。
+
+    按内置版本（2.5.0）逐字复刻该函数、去掉 sock 访问，替换之；
+    try/except 防未来版本漂移（漂移时 requests 链路失效但不崩）。
+    """
+    try:
+        import urllib3.connection as _uconn
+        from urllib3._collections import HTTPHeaderDict as _HeaderDict
+        from urllib3.response import HTTPResponse as _U3Response
+    except Exception:
+        return
+
+    def _u3_getresponse(self):
+        if getattr(self, "_response_options", None) is None:
+            from urllib3.exceptions import ResponseNotReady
+
+            raise ResponseNotReady()
+        resp_options = self._response_options
+        self._response_options = None
+        httplib_response = super(_uconn.HTTPConnection, self).getresponse()
+        headers = _HeaderDict(httplib_response.msg.items())
+        return _U3Response(
+            body=httplib_response,
+            headers=headers,
+            status=httplib_response.status,
+            version=httplib_response.version,
+            version_string=getattr(self, "_http_vsn_str", "HTTP/?"),
+            reason=httplib_response.reason,
+            preload_content=resp_options.preload_content,
+            decode_content=resp_options.decode_content,
+            original_response=httplib_response,
+            enforce_content_length=resp_options.enforce_content_length,
+            request_method=resp_options.request_method,
+            request_url=resp_options.request_url,
+        )
+
+    try:
+        _uconn.HTTPConnection.getresponse = _u3_getresponse
+    except Exception:
+        pass
 
 
 def _restore_urllib3():
@@ -208,8 +256,9 @@ def _restore_urllib3():
     # https 池 _validate_conn 会在发请求前触发真 socket 的 connect()
     # ——沙箱无 socket，连接由原生代理完成，置为空操作
     try:
-        _cp = __import__("urllib3.connectionpool", fromlist=["HTTPSConnection"])
-        _cp.HTTPSConnection.connect = lambda self, *a, **k: None
+        import urllib3.connectionpool as _cp2
+
+        _cp2.HTTPSConnection.connect = lambda self, *a, **k: None
     except Exception:
         pass
 
@@ -234,9 +283,11 @@ def install():
 def ensure():
     """每次脚本执行前调用（幂等、廉价）。
 
-    bootstrap 时 urllib3 尚未加载，_restore_urllib3 无事可做；用户脚本
-    的 import 触发 urllib3 装载时会重新执行 inject_into_urllib3，把
-    连接类换回浏览器 XHR 实现。此处在 loadPackagesFromImports 之后、
-    用户代码之前再还原一次。
+    bootstrap 时 urllib3 尚未加载，restore 无事可做；用户脚本 import
+    触发 urllib3 装载时会重新执行 inject_into_urllib3，把连接类换回
+    浏览器 XHR 实现。此处在 loadPackagesFromImports 之后、用户代码
+    之前再还原一次。
     """
-    _restore_urllib3()
+    if "urllib3" in __import__("sys").modules:
+        _patch_urllib3_connection_cls()
+        _restore_urllib3()

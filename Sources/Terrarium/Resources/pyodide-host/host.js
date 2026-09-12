@@ -114,7 +114,11 @@ if _target not in sys.path:
       const modResp = await fetch("pyodide-local://host/mianshu_http.py");
       if (!modResp.ok) throw new Error("fetch 失败: " + modResp.status);
       const modText = await modResp.text();
-      pyodide.FS.writeFile("/lib/python3.13/site-packages/mianshu_http.py", modText, { encoding: "utf8" });
+      // site-packages 路径经 sysconfig 取（Python 升级 3.14 不失效）
+      const siteDir = pyodide.runPython(
+        "import sysconfig; sysconfig.get_paths()['purelib']"
+      );
+      pyodide.FS.writeFile(siteDir + "/mianshu_http.py", modText, { encoding: "utf8" });
       await pyodide.runPythonAsync("import mianshu_http; mianshu_http.install()");
     } catch (e) {
       bootWarnings.push("mianshu_http 注入失败，联网脚本不可用: " + String(e && e.message || e));

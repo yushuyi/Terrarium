@@ -23,8 +23,10 @@
 //    可控（新浪行情等站点的 Referer 校验因此可通过）
 //
 //  代理协议：u = 目标 URL（b64url），r = 请求规格 JSON 的 b64url
-//  {method, headers: {..}, bodyB64?}；响应镜像目标状态码，
-//  目标响应头整体编码进 X-Ms-Headers（b64url JSON）供 Python 重组。
+//  {method, headers: {..}, bodyB64?, timeoutMs?}；响应统一 JSON 信封
+//  {"status","headers","bodyB64"} 固定 200 交付（Python 侧重组标准
+//  HTTPResponse）；Transfer-Encoding/失真的 Content-Length 与
+//  Content-Encoding 由 Swift 侧剔除，body 恒为最终原始字节。
 //
 //  注意：.wasm 必须返回 Content-Type: application/wasm，
 //  否则 WebAssembly.instantiateStreaming 会拒收。
@@ -43,12 +45,27 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
         "host": "pyodide-host",
     ]
 
-    /// 已被 stop 的任务——之后对它调用 didReceive 会崩溃，必须过滤
+    /// 已被 stop 的任务——之后对它调用 didReceive 会崩溃，必须过滤。
+    /// 只记录「仍有异步交付在途」的任务（stop 时 inflightProxy 命中才插入），
+    /// 交付生命周期结束即移除：防止集合无界增长，也防止已释放任务的
+    /// ObjectIdentifier 地址被新任务复用而遭误判（会静默丢交付、同步 XHR 永挂）。
     private let lock = NSLock()
     private var stoppedTasks = Set<ObjectIdentifier>()
 
     /// 进行中的代理请求：SchemeTask 标识 → URLSessionTask（stop 时取消）
     private var inflightProxy: [ObjectIdentifier: URLSessionTask] = [:]
+
+    /// 代理专用会话：ephemeral + 关 Cookie——沙箱请求不得携带/污染
+    /// App 的 HTTPCookieStorage.shared 凭据；资源超时与请求超时同限 60s，
+    /// 防慢速滴流服务器把同步 XHR 拖过 WebKit 看门狗
+    private lazy var proxySession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpShouldSetCookies = false
+        config.httpCookieAcceptPolicy = .never
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 60
+        return URLSession(configuration: config)
+    }()
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
         guard let url = task.request.url, url.scheme == Self.scheme else {
@@ -101,8 +118,12 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
     func webView(_ webView: WKWebView, stop task: WKURLSchemeTask) {
         let taskId = ObjectIdentifier(task)
         lock.lock()
-        stoppedTasks.insert(taskId)
         let urlTask = inflightProxy.removeValue(forKey: taskId)
+        // 仅异步在途任务需要记录 stopped；同步交付的任务（文件/错误分支）
+        // 在 start 回调内主线程完成，stop 无法插队，无需记录
+        if urlTask != nil {
+            stoppedTasks.insert(taskId)
+        }
         lock.unlock()
         urlTask?.cancel()
     }
@@ -114,13 +135,16 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
         let method: String?
         let headers: [String: String]?
         let bodyB64: String?
+        let timeoutMs: Int?
 
         func urlRequest(target: URL) -> URLRequest? {
             // 只放行 http/https，防 file:// 等本地 scheme 穿越
             guard target.scheme == "http" || target.scheme == "https" else { return nil }
             var request = URLRequest(url: target)
             request.httpMethod = (method ?? "GET").uppercased()
-            request.timeoutInterval = 60
+            // 1s ~ 300s 夹取，防沙箱侧传异常值拖垮同步 XHR
+            let timeoutS = Double(min(max(timeoutMs ?? 60_000, 1), 300_000)) / 1000.0
+            request.timeoutInterval = timeoutS
             headers?.forEach { key, value in
                 guard !key.isEmpty else { return }
                 request.setValue(value, forHTTPHeaderField: key)
@@ -141,11 +165,13 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
 
     private func startProxy(_ task: WKURLSchemeTask, proxyURL: URL) {
         let taskId = ObjectIdentifier(task)
+        let comps = URLComponents(url: proxyURL, resolvingAgainstBaseURL: false)
+        let query = comps?.queryItems
+        // 只记录目标 URL（u），不落 r 参数（内含 Authorization/Cookie 等凭据头）
+        let loggedTarget = query?.first(where: { $0.name == "u" })?.value?.prefix(120) ?? "?"
         guard
-            let comps = URLComponents(url: proxyURL, resolvingAgainstBaseURL: false),
-            let query = comps.queryItems,
-            let targetB64 = query.first(where: { $0.name == "u" })?.value,
-            let reqB64 = query.first(where: { $0.name == "r" })?.value,
+            let targetB64 = query?.first(where: { $0.name == "u" })?.value,
+            let reqB64 = query?.first(where: { $0.name == "r" })?.value,
             let targetData = ProxyRequestSpec.b64urlDecode(targetB64),
             let targetString = String(data: targetData, encoding: .utf8),
             let targetURL = URL(string: targetString),
@@ -153,18 +179,22 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
             let spec = try? JSONDecoder().decode(ProxyRequestSpec.self, from: reqData),
             let request = spec.urlRequest(target: targetURL)
         else {
-            NSLog("[PyodideSchemeHandler] 代理请求参数无效: \(proxyURL.absoluteString.prefix(200))")
+            NSLog("[PyodideSchemeHandler] 代理请求参数无效: \(loggedTarget)")
             deliver(task) { task.didFailWithError(URLError(.badURL)) }
             return
         }
 
-        let urlTask = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        let urlTask = proxySession.dataTask(with: request) { [weak self] data, response, error in
             // SchemeTask 只能在主线程操作；URLSession 回调线程任意
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.lock.lock()
                 self.inflightProxy.removeValue(forKey: taskId)
                 let stopped = self.stoppedTasks.contains(taskId)
+                if stopped {
+                    // 交付生命周期在此终结，解除标记防 ObjectIdentifier 复用误判
+                    self.stoppedTasks.remove(taskId)
+                }
                 self.lock.unlock()
                 guard !stopped else { return }
                 self.finishProxy(task, data: data, response: response, error: error, target: targetURL)
@@ -191,9 +221,29 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
             envelope = ["status": 0, "error": error.localizedDescription]
         } else {
             let http = response as? HTTPURLResponse
+            // 逐项转换防「个别非 String 值导致整个头字典丢失」
+            var headers: [String: String] = [:]
+            for (key, value) in http?.allHeaderFields ?? [:] {
+                headers["\(key)"] = "\(value)"
+            }
+            let bodyCount = data?.count ?? 0
+            // URLSession 已交付解 chunk 的最终 body，原样回传的头会自相矛盾：
+            // - Transfer-Encoding: chunked 必剔（body 已不再是 chunk 编码）
+            // - Content-Length 与实际不符（透明解压/去 chunk）必剔，让
+            //   Python 侧走 read-until-EOF（信封 body 就是完整 body）
+            // - Content-Encoding 在发生透明解压时必剔，防二次解压
+            headers.removeValue(forKey: "Transfer-Encoding")
+            headers.removeValue(forKey: "transfer-encoding")
+            let expected = http?.expectedContentLength ?? -1
+            if expected < 0 || expected != bodyCount {
+                headers.removeValue(forKey: "Content-Length")
+                headers.removeValue(forKey: "content-length")
+                headers.removeValue(forKey: "Content-Encoding")
+                headers.removeValue(forKey: "content-encoding")
+            }
             envelope = [
                 "status": http?.statusCode ?? 502,
-                "headers": http?.allHeaderFields as? [String: String] ?? [:],
+                "headers": headers,
                 "bodyB64": data?.base64EncodedString() ?? "",
             ]
         }
@@ -202,18 +252,19 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
             url: task.request.url ?? target,
             statusCode: 200,
             httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "application/json"]
+            // 宿主页源是 pyodide-local://host，net 分支跨源：没有 ACAO
+            // 同步 XHR 会被 CORS 拦成 status 0
+            headerFields: [
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+            ]
         )!
         deliver(task) { task.didReceive(out) }
         deliver(task) { task.didReceive(body) }
         deliver(task) { task.didFinish() }
-    }
-
-    private static func b64urlEncode(_ data: Data) -> String {
-        data.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
+        lock.lock()
+        stoppedTasks.remove(ObjectIdentifier(task))
+        lock.unlock()
     }
 
     // MARK: - Helpers
