@@ -117,13 +117,13 @@ if "${sitePackages}" not in sys.path:
 
     // Pre-load micropip — it's tiny (~150 KB) and we use it for every
     // `%pip install`. Without this, the first install pays a load tax.
-    await pyodide.loadPackage("micropip");
+    await pyodide.loadPackage("micropip", { messageCallback: () => {}, errorCallback: () => {} });
 
     // ssl：http.client.HTTPSConnection 的依赖包。沙箱内不做真 TLS
     // （由原生 URLSession 完成），但类结构必须存在，否则 urllib3 降级
     // 为 DummyConnection 且 mianshu_http 注入失败
     try {
-      await pyodide.loadPackage("ssl");
+      await pyodide.loadPackage("ssl", { messageCallback: () => {}, errorCallback: () => {} });
     } catch (e) {
       bootWarnings.push("ssl 包加载失败，https 请求将不可用");
       console.warn("[mianshu_http] ssl 包加载失败:", e);
@@ -146,8 +146,10 @@ if "${sitePackages}" not in sys.path:
         }
         window.__MS_LOCKFILE_FILES__ = files;
         window.__MS_LOCKFILE_DEPS__ = deps;
+        window.__MS_PYODIDE_VERSION__ = pyodide.version;
       }
     } catch (e) {
+      bootWarnings.push("lockfile 映射注入失败，CDN 兜底不可用: " + String(e && e.message || e));
       console.warn("[pyodide] lockfile 映射注入失败:", e);
     }
 
