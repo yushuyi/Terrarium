@@ -14,6 +14,8 @@ let pyodideReady = false;
 let stdoutBuf = "";
 let stderrBuf = "";
 let progressBuf = [];
+// 当前正在执行的 runPython 调用 id——stdout/stderr 回调据此做流式转发
+let currentRunId = null;
 
 // Persistent storage path inside Pyodide's emscripten FS. We mount IDBFS
 // here so installed packages survive WebView reloads (and thus app
@@ -35,12 +37,25 @@ async function syncFS(populate) {
 async function bootstrap() {
   try {
     pyodide = await loadPyodide({
-      // jsDelivr's CDN is Pyodide's canonical distribution channel for
-      // the runtime + ~250 prebuilt WASM packages. Pinned to v0.29.4
-      // to match the loader script in host.html.
-      indexURL: "https://cdn.jsdelivr.net/pyodide/v0.29.4/full/",
-      stdout: (text) => { stdoutBuf += text + "\n"; },
-      stderr: (text) => { stderrBuf += text + "\n"; },
+      // 离线模式：运行时与常用包（numpy/pandas/matplotlib 闭包 + micropip）
+      // 全部经 pyodide-local:// 从 App Bundle 伺服，由
+      // PyodideSchemeHandler 提供文件，不走 CDN。版本由
+      // Scripts/fetch-pyodide.sh 锁定（0.29.4），与 bundle 内容一致。
+      indexURL: "pyodide-local://bundle/",
+      stdout: (text) => {
+        stdoutBuf += text + "\n";
+        // 流式转发给 Swift（__TERRARIUM_IMG__ 标记行留给 runResult，
+        // 图像渲染走专门通道，不刷终端）
+        if (currentRunId && !text.startsWith("__TERRARIUM_IMG_PNG_B64__:")) {
+          post({ kind: "stdout", id: currentRunId, line: text });
+        }
+      },
+      stderr: (text) => {
+        stderrBuf += text + "\n";
+        if (currentRunId) {
+          post({ kind: "stderr", id: currentRunId, line: text });
+        }
+      },
     });
 
     // Mount IDBFS at /persist and pull any previously-synced packages
@@ -99,6 +114,7 @@ async function runPython(id, code) {
     return;
   }
   resetBuffers();
+  currentRunId = id;
   const t0 = performance.now();
   let exception = null;
   let exitCode = 0;
@@ -113,6 +129,8 @@ async function runPython(id, code) {
   } catch (e) {
     exception = String(e && e.message || e);
     exitCode = 1;
+  } finally {
+    currentRunId = null;
   }
   const durationMs = Math.round(performance.now() - t0);
   // Sync any FS changes the user code made to IDBFS so they persist.
@@ -210,10 +228,11 @@ async function installPackage(id, pkg) {
       // and try micropip next.
       const m = String(loadErr && loadErr.message || loadErr);
       // If the error is anything OTHER than "not in index", re-raise.
-      if (!/Can't find a package/i.test(m) && !/not found/i.test(m)) {
+      // 404 视同「不在本地 bundle」——离线模式下未打包的包走 micropip 兜底。
+      if (!/Can't find a package/i.test(m) && !/not found/i.test(m) && !/404/.test(m)) {
         throw loadErr;
       }
-      post({ kind: "installProgress", id, line: `  Package not in Pyodide index, falling back to PyPI…` });
+      post({ kind: "installProgress", id, line: `  Package not in local bundle, falling back to PyPI…` });
     }
 
     // FALLBACK PATH — micropip.install for arbitrary PyPI packages.

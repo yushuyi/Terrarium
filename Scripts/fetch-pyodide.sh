@@ -43,7 +43,8 @@ lock = json.load(open(os.path.join(dest, "pyodide-lock.json")))
 pkgs = lock["packages"] if isinstance(lock["packages"], dict) else {p["name"]: p for p in lock["packages"]}
 
 # numpy + pandas + matplotlib 的传递依赖闭包
-targets = ["numpy", "pandas", "matplotlib"]
+# micropip：bootstrap 阶段 loadPackage("micropip") 必需，缺了会 404 导致启动失败
+targets = ["numpy", "pandas", "matplotlib", "micropip"]
 need = set()
 def add(name):
     if name in need or name not in pkgs:

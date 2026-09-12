@@ -49,6 +49,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
     private var pendingList: [String: CheckedContinuation<[PyodidePackageInfo], Never>] = [:]
     private var pendingClear: [String: CheckedContinuation<Bool, Never>] = [:]
 
+    /// 每次运行的逐行输出回调（流式 stdout/stderr），按运行 id 索引
+    private var outputHandlers: [String: (PyodideOutputLine) -> Void] = [:]
+
     /// Per-install progress callbacks (streamed `Collecting … / Successfully
     /// installed …` lines from micropip). Keyed by the install's call id.
     private var installProgressHandlers: [String: (String) -> Void] = [:]
@@ -72,6 +75,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
         // (installed packages) survives app restarts automatically.
         config.websiteDataStore = .default()
 
+        // 本地 scheme：离线伺服 Bundle 内的 pyodide 运行时与宿主页
+        config.setURLSchemeHandler(PyodideSchemeHandler(), forURLScheme: PyodideSchemeHandler.scheme)
+
         messageHandler = MessageHandler(owner: self)
         config.userContentController.add(messageHandler, name: "terrariumPyodide")
 
@@ -87,23 +93,13 @@ public final class PyodideBridge: NSObject, ObservableObject {
     }
 
     private func loadHostPage() {
-        // pyodide-host/ lives inside Terrarium's SwiftPM resource bundle
-        // (declared in Package.swift via `.copy("Resources/pyodide-host")`).
-        // `Bundle.module` is the auto-generated package bundle that
-        // SwiftPM injects at compile time.
-        guard let url = Bundle.module.url(
-            forResource: "host",
-            withExtension: "html",
-            subdirectory: "pyodide-host"
-        ) else {
-            loadError = "Could not locate pyodide-host/host.html inside Terrarium's resource bundle. This indicates the package was built without its Resources — usually a SwiftPM cache issue. Try cleaning the build folder and rebuilding."
+        // 宿主页经本地 scheme 加载（pyodide-local://host/host.html），
+        // 与 pyodide-local://bundle/ 下的运行时资源全同源，完全离线。
+        guard let url = URL(string: "\(PyodideSchemeHandler.scheme)://host/host.html") else {
+            loadError = "无法构造 pyodide-local scheme URL（PyodideSchemeHandler.scheme 异常）"
             return
         }
-        // Pyodide's JS host loads adjacent files (pyodide.asm.wasm,
-        // python_stdlib.zip, etc.) via relative paths. Grant the
-        // WKWebView read access to the whole pyodide-host directory.
-        let hostDir = url.deletingLastPathComponent()
-        webView.loadFileURL(url, allowingReadAccessTo: hostDir)
+        webView.load(URLRequest(url: url))
     }
 
     /// Await Pyodide finishing its bootstrap (loading the WASM module,
@@ -121,16 +117,50 @@ public final class PyodideBridge: NSObject, ObservableObject {
     // MARK: Run code
 
     public func runPython(code: String) async -> PyodideRunResult {
+        await runPython(code: code, onOutput: nil, timeout: nil)
+    }
+
+    /// 执行 Python 代码。
+    /// - Parameters:
+    ///   - onOutput: 逐行输出回调（stdout/stderr 流式），行到达即触发
+    ///   - timeout: 超时秒数；超时后重载宿主页（JS 死循环无法从外部
+    ///     中断，进程级重置是唯一可靠杀法），并以超时错误完成本次调用
+    public func runPython(
+        code: String,
+        onOutput: ((PyodideOutputLine) -> Void)?,
+        timeout: TimeInterval?
+    ) async -> PyodideRunResult {
         try? await awaitReady()
         guard isReady else {
             return PyodideRunResult(stdout: "", stderr: loadError ?? "Pyodide not ready",
                                     exception: nil, exitCode: -1, durationMs: 0)
         }
         let id = UUID().uuidString
+        if let onOutput { outputHandlers[id] = onOutput }
         return await withCheckedContinuation { (cont: CheckedContinuation<PyodideRunResult, Never>) in
             pendingRun[id] = cont
             let escaped = Self.jsStringLiteral(code)
             webView.evaluateJavaScript("window.terrariumRunPython(\(Self.jsStringLiteral(id)), \(escaped));", completionHandler: nil)
+            if let timeout { scheduleTimeout(id: id, timeout: timeout) }
+        }
+    }
+
+    /// 超时兜底：到点仍未回结果 → 清理该次调用的状态并重载宿主页。
+    /// 重载后 JS 侧会重新 bootstrap 并再次 post ready。
+    private func scheduleTimeout(id: String, timeout: TimeInterval) {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard let self, let cont = self.pendingRun.removeValue(forKey: id) else { return }
+            self.outputHandlers.removeValue(forKey: id)
+            self.isReady = false
+            self.loadHostPage()
+            cont.resume(returning: PyodideRunResult(
+                stdout: "",
+                stderr: "",
+                exception: "执行超时（超过 \(Int(timeout)) 秒），Pyodide 运行时已重置",
+                exitCode: -1,
+                durationMs: Int(timeout * 1000)
+            ))
         }
     }
 
@@ -214,6 +244,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
         case "runResult":
             guard let id = body["id"] as? String,
                   let cont = pendingRun.removeValue(forKey: id) else { return }
+            outputHandlers.removeValue(forKey: id)
             cont.resume(returning: PyodideRunResult(
                 stdout: (body["stdout"] as? String) ?? "",
                 stderr: (body["stderr"] as? String) ?? "",
@@ -221,6 +252,12 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 exitCode: (body["exitCode"] as? Int) ?? 0,
                 durationMs: (body["durationMs"] as? Int) ?? 0
             ))
+        case "stdout", "stderr":
+            // 流式输出：行到达即回调；无回调方时仅由 JS 侧缓冲进 runResult
+            guard let id = body["id"] as? String,
+                  let line = body["line"] as? String,
+                  let handler = outputHandlers[id] else { return }
+            handler(PyodideOutputLine(text: line, isStderr: kind == "stderr"))
         case "installProgress":
             guard let id = body["id"] as? String,
                   let line = body["line"] as? String else { return }
@@ -279,6 +316,12 @@ public struct PyodideRunResult: Sendable {
     public let exitCode: Int
     public let durationMs: Int
     public var isSuccess: Bool { exitCode == 0 && exception == nil }
+}
+
+/// 逐行流式输出（runPython 的 onOutput 回调载荷）
+public struct PyodideOutputLine: Sendable {
+    public let text: String
+    public let isStderr: Bool
 }
 
 public struct PyodideInstallResult: Sendable {
