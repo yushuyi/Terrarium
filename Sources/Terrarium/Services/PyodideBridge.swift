@@ -131,6 +131,16 @@ public final class PyodideBridge: NSObject, ObservableObject {
         webView.load(URLRequest(url: url))
     }
 
+    /// 预热：提前触发 bootstrap（wasm 编译 + micropip 就绪），首次执行零等待。
+    /// 幂等——内部收敛到 awaitReady，与首次执行并发安全。
+    public func prewarm() {
+        Task { @MainActor [weak self] in
+            guard self != nil else { return }
+            try? await PyodideBridge.shared.awaitReady()
+            NSLog("[Pyodide] 预热完成")
+        }
+    }
+
     /// Await Pyodide finishing its bootstrap (loading the WASM module,
     /// mounting IDBFS, pre-loading micropip). Safe to call repeatedly.
     public func awaitReady() async throws {

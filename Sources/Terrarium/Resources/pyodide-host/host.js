@@ -122,10 +122,11 @@ async function runPython(id, code) {
   const t0 = performance.now();
   let exception = null;
   let exitCode = 0;
-  try {
+
+  const loadFromLockfile = async () => {
     // 按 import 自动加载 lockfile 内的包：bundle 内的 wheel 经
     // pyodide-local:// 离线伺服；未打包的包会 404——捕获后放行，
-    // 让用户代码以明确的 ModuleNotFoundError 失败（后续可接 micropip 兜底）
+    // 让用户代码以明确的 ModuleNotFoundError 失败（再由 micropip 兜底）
     try {
       await pyodide.loadPackagesFromImports(code, {
         messageCallback: (m) => {
@@ -137,6 +138,10 @@ async function runPython(id, code) {
         post({ kind: "stderr", id: currentRunId, line: "[pyodide] 自动加载依赖失败: " + String(loadErr && loadErr.message || loadErr) });
       }
     }
+  };
+
+  const runUser = async () => {
+    await loadFromLockfile();
     await pyodide.runPythonAsync(code);
     // Jupyter-style auto-show: if the user's code created matplotlib
     // figures but never called `.show()` or saved them, auto-render
@@ -144,6 +149,44 @@ async function runPython(id, code) {
     // This is the same convention Jupyter / IPython uses for plt.plot()
     // calls at the end of a cell — it's what users expect to happen.
     await autoShowMatplotlibFigures();
+  };
+
+  try {
+    try {
+      await runUser();
+    } catch (runErr) {
+      // micropip 纯包兜底：缺失模块不在离线 bundle（如 tushare）时，
+      // 从 PyPI 拉纯 wheel 安装（需网络），destination 指向 /persist
+      // 使安装跨启动保留；锁表内包的失败是「真缺包」，不在此列也无妨
+      // （micropip 会失败并回传原始错误）。
+      const msg = String(runErr && runErr.message || runErr);
+      const m = /ModuleNotFoundError: No module named '([^']+)'/.exec(msg);
+      if (!m) throw runErr;
+      const missing = m[1].split(".")[0].replace(/-/g, "_");
+      if (currentRunId) {
+        post({ kind: "stderr", id: currentRunId, line: "[pyodide] " + missing + " 不在离线 bundle，尝试 micropip 安装（需网络）…" });
+      }
+      try {
+        await pyodide.loadPackage("micropip");
+        // destination 不被旧版 micropip 支持时退化为默认位置（仅本次会话有效）
+        await pyodide.runPythonAsync(
+          "import micropip\n" +
+          "try:\n" +
+          "    await micropip.install('" + missing + "', destination='/persist/site-packages')\n" +
+          "except TypeError:\n" +
+          "    await micropip.install('" + missing + "')"
+        );
+      } catch (installErr) {
+        if (currentRunId) {
+          post({ kind: "stderr", id: currentRunId, line: "[pyodide] micropip 安装失败: " + String(installErr && installErr.message || installErr) });
+        }
+        throw runErr; // 原始 ModuleNotFoundError 才是用户要看的错误
+      }
+      if (currentRunId) {
+        post({ kind: "stderr", id: currentRunId, line: "[pyodide] " + missing + " 安装完成，重新执行脚本" });
+      }
+      await runUser(); // 二次失败直接向外抛，错误信息真实
+    }
   } catch (e) {
     exception = String(e && e.message || e);
     exitCode = 1;
