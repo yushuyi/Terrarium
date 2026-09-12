@@ -55,16 +55,37 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
     /// 进行中的代理请求：SchemeTask 标识 → URLSessionTask（stop 时取消）
     private var inflightProxy: [ObjectIdentifier: URLSessionTask] = [:]
 
+    /// 重定向策略：一律不跟随，30x 原样交付 Python。
+    /// urllib.request 的 HTTPRedirectHandler 与 requests 各自实现了完整的
+    /// 重定向语义（allow_redirects、POST→GET 改写、次数上限），Swift 层
+    /// 抢先跟随会让 Python 拿到最终 200，allow_redirects=False 失效，
+    /// 与 Mac 行为不一致；30x 交还后由 Python 上层按自身语义处理。
+    private final class NoRedirectDelegate: NSObject, URLSessionDataDelegate {
+        func urlSession(
+            _ session: URLSession,
+            task: URLSessionTask,
+            willPerformHTTPRedirection response: HTTPURLResponse,
+            newRequest request: URLRequest,
+            completionHandler: @escaping (URLRequest?) -> Void
+        ) {
+            completionHandler(nil)
+        }
+    }
+
+    private let redirectDelegate = NoRedirectDelegate()
+
     /// 代理专用会话：ephemeral + 关 Cookie——沙箱请求不得携带/污染
     /// App 的 HTTPCookieStorage.shared 凭据；资源超时与请求超时同限 60s，
-    /// 防慢速滴流服务器把同步 XHR 拖过 WebKit 看门狗
+    /// 防慢速滴流服务器把同步 XHR 拖过 WebKit 看门狗。
+    /// delegate 仅用于拦截重定向（其余事件走默认处理，dataTask 的
+    /// completionHandler 语义不受影响）
     private lazy var proxySession: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.httpShouldSetCookies = false
         config.httpCookieAcceptPolicy = .never
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 60
-        return URLSession(configuration: config)
+        return URLSession(configuration: config, delegate: redirectDelegate, delegateQueue: nil)
     }()
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
