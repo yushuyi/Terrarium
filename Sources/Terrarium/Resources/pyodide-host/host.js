@@ -135,6 +135,20 @@ if "${sitePackages}" not in sys.path:
     try {
       const modResp = await fetch("pyodide-local://host/mianshu_http.py");
       if (!modResp.ok) throw new Error("fetch 失败: " + modResp.status);
+      // lockfile 文件名映射：micropip 对发行版包拼 indexURL 相对 URL
+      // （pyodide-local://bundle/<file_name>），bundle 未打包的 wheel
+      // （scipy 等）404——pip/安装兜底据此把 URL 重定向到官方 CDN
+      try {
+        const lockResp = await fetch("pyodide-local://bundle/pyodide-lock.json");
+        if (lockResp.ok) {
+          const lock = await lockResp.json();
+          const files = {};
+          for (const [name, info] of Object.entries(lock.packages || {})) {
+            files[name] = info.file_name || "";
+          }
+          window.__MS_LOCKFILE_FILES__ = files;
+        }
+      } catch (_) {}
       const modText = await modResp.text();
       // site-packages 路径经 sysconfig 取（Python 升级 3.14 不失效）
       const siteDir = pyodide.runPython(
@@ -240,7 +254,12 @@ async function runPython(id, code) {
         const canonical = DEP_ALIASES[dep] || dep;
         if (pyodide.loadedPackages[canonical] || pyodide.loadedPackages[dep]) continue;
         try {
-          await pyodide.loadPackage(canonical, { messageCallback: () => {} });
+          await pyodide.loadPackage(canonical, {
+            messageCallback: () => {},
+            // 本地 404 的包（如 persist 里的 scipy 及其依赖）会触发
+            // errorCallback，默认走 console.error 在终端刷红字杂音
+            errorCallback: () => {},
+          });
         } catch (_) {}
       }
     } catch (persistErr) {
@@ -252,7 +271,13 @@ async function runPython(id, code) {
       // pyodide 退回默认 console.log，经 WebView console 捕获转成
       // stdout（绿色）上屏；失败仍由外层 catch 与后续
       // ModuleNotFoundError 明确暴露
-      await pyodide.loadPackagesFromImports(code, { messageCallback: () => {} });
+      await pyodide.loadPackagesFromImports(code, {
+        messageCallback: () => {},
+        // errorCallback 也须静默：bundle 未打包的 lockfile 包（如 pip 装
+        // 进 persist 的 scipy）会连带 404 其声明依赖，红字杂音误导用户；
+        // 真正的失败由用户代码的 ModuleNotFoundError 明确暴露
+        errorCallback: () => {},
+      });
     } catch (loadErr) {
       if (currentRunId) {
         post({ kind: "stderr", id: currentRunId, line: "[pyodide] 自动加载依赖失败: " + String(loadErr && loadErr.message || loadErr) });
