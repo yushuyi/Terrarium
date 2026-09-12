@@ -32,6 +32,9 @@ let package = Package(
             resources: [
                 // Pyodide WKWebView 宿主页（host.html / host.js）
                 .copy("Resources/pyodide-host"),
+                // 离线运行时：pyodide-core + numpy/pandas/matplotlib 依赖闭包（~30MB）
+                // 由 Scripts/fetch-pyodide.sh 生成，随包提交
+                .copy("Resources/pyodide-runtime"),
             ]
         ),
     ]
