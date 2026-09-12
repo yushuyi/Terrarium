@@ -167,7 +167,10 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
         }
     }
 
-    private func startProxy(_ task: WKURLSchemeTask, proxyURL: URL) {
+    private func startProxy(
+        _ task: WKURLSchemeTask, proxyURL: URL, isRetry: Bool = false,
+        overrideRequest: URLRequest? = nil
+    ) {
         let taskId = ObjectIdentifier(task)
         let comps = URLComponents(url: proxyURL, resolvingAgainstBaseURL: false)
         let query = comps?.queryItems
@@ -181,7 +184,7 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
             let targetURL = URL(string: targetString),
             let reqData = ProxyRequestSpec.b64urlDecode(reqB64),
             let spec = try? JSONDecoder().decode(ProxyRequestSpec.self, from: reqData),
-            let request = spec.urlRequest(target: targetURL)
+            let request = overrideRequest ?? spec.urlRequest(target: targetURL)
         else {
             NSLog("[PyodideSchemeHandler] 代理请求参数无效: \(loggedTarget)")
             deliver(task) { task.didFailWithError(URLError(.badURL)) }
@@ -201,6 +204,23 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
                 }
                 self.lock.unlock()
                 guard !stopped else { return }
+                // ATS 兜底：设备端 NSAllowsArbitraryLoads 未被 CFNetwork 尊重时，
+                // http 目标被 -1022 拦截——自动升级 https 重试一次（http-only
+                // 站点升级失败则按原错误交付，不劣化）
+                if let error,
+                   (error as? URLError)?.code == .appTransportSecurityRequiresSecureConnection,
+                   !isRetry,
+                   var comps = URLComponents(url: request.url ?? targetURL, resolvingAgainstBaseURL: false),
+                   comps.scheme == "http" {
+                    comps.scheme = "https"
+                    if let httpsURL = comps.url {
+                        var upgraded = request
+                        upgraded.url = httpsURL
+                        NSLog("[PyodideSchemeHandler] ATS 拦截，升级 https 重试: \(loggedTarget)")
+                        self.startProxy(task, proxyURL: proxyURL, isRetry: true, overrideRequest: upgraded)
+                        return
+                    }
+                }
                 self.finishProxy(task, data: data, response: response, error: error, target: targetURL)
             }
         }
