@@ -174,6 +174,10 @@ async function runPython(id, code) {
 
   const runUser = async () => {
     await loadFromLockfile();
+    // urllib3 在用户 import 时会被再次注入 emscripten 连接类，执行前还原
+    try {
+      await pyodide.runPythonAsync("import mianshu_http; mianshu_http.ensure()");
+    } catch (_) {}
     await pyodide.runPythonAsync(code);
     // Jupyter-style auto-show: if the user's code created matplotlib
     // figures but never called `.show()` or saved them, auto-render

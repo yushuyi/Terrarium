@@ -229,3 +229,14 @@ def install():
         _install_class(_MSHTTPSConnection, "https")
         _ms_https_cls = _MSHTTPSConnection
     _restore_urllib3()
+
+
+def ensure():
+    """每次脚本执行前调用（幂等、廉价）。
+
+    bootstrap 时 urllib3 尚未加载，_restore_urllib3 无事可做；用户脚本
+    的 import 触发 urllib3 装载时会重新执行 inject_into_urllib3，把
+    连接类换回浏览器 XHR 实现。此处在 loadPackagesFromImports 之后、
+    用户代码之前再还原一次。
+    """
+    _restore_urllib3()
