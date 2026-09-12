@@ -95,6 +95,19 @@ if _target not in sys.path:
     sys.path.insert(0, _target)
 `);
 
+    // mianshu_http：把 http.client 改道原生网络代理（同步桥）。
+    // requests/urllib/urllib3 零改动可用；Referer/CORS 限制由原生侧绕过。
+    // 注入失败不阻断 bootstrap（纯标准库脚本不需要它）。
+    try {
+      const modResp = await fetch("pyodide-local://host/mianshu_http.py");
+      if (!modResp.ok) throw new Error("fetch 失败: " + modResp.status);
+      const modText = await modResp.text();
+      pyodide.FS.writeFile("/lib/python3.13/site-packages/mianshu_http.py", modText, { encoding: "utf8" });
+      await pyodide.runPythonAsync("import mianshu_http; mianshu_http.install()");
+    } catch (e) {
+      console.warn("[mianshu_http] 注入失败（联网脚本将不可用）:", e);
+    }
+
     pyodideReady = true;
     post({ kind: "ready", version: pyodide.version });
   } catch (err) {
