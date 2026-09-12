@@ -147,6 +147,10 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
             request.timeoutInterval = timeoutS
             headers?.forEach { key, value in
                 guard !key.isEmpty else { return }
+                // Accept-Encoding 由 URLSession 自管：客户端手动设置会关闭
+                // CFNetwork 的透明解压，导致 body 与 Content-Encoding 头
+                // 不一致；剥掉后 URLSession 自己协商并解压，信封 body 恒为明文
+                if key.caseInsensitiveCompare("Accept-Encoding") == .orderedSame { return }
                 request.setValue(value, forHTTPHeaderField: key)
             }
             if let bodyB64, let body = Self.b64urlDecode(bodyB64), !body.isEmpty {
@@ -238,9 +242,11 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
             if expected < 0 || expected != bodyCount {
                 headers.removeValue(forKey: "Content-Length")
                 headers.removeValue(forKey: "content-length")
-                headers.removeValue(forKey: "Content-Encoding")
-                headers.removeValue(forKey: "content-encoding")
             }
+            // Content-Encoding 无条件剔除：Accept-Encoding 已由本端接管，
+            // body 恒为 URLSession 交付的最终明文字节，防止 Python 侧二次解压
+            headers.removeValue(forKey: "Content-Encoding")
+            headers.removeValue(forKey: "content-encoding")
             envelope = [
                 "status": http?.statusCode ?? 502,
                 "headers": headers,
