@@ -253,16 +253,18 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
             let bodyCount = data?.count ?? 0
             // URLSession 已交付解 chunk 的最终 body，原样回传的头会自相矛盾：
             // - Transfer-Encoding: chunked 必剔（body 已不再是 chunk 编码）
-            // - Content-Length 与实际不符（透明解压/去 chunk）必剔，让
-            //   Python 侧走 read-until-EOF（信封 body 就是完整 body）
             // - Content-Encoding 在发生透明解压时必剔，防二次解压
+            // - Content-Length 必须重写为实际 body 长度：服务端对 gzip 响应
+            //   给的头是压缩前字节数（如 749），URLSession 透明解压后交付的
+            //   body 是明文（1732），allHeaderFields 保留的原始头与 body 不符，
+            //   Python 侧 HTTPResponse 按头截断会静默丢掉后半段数据
+            //   （真机实测：新浪行情 7 只只回前 2 行即此因）。
+            //   不能用 expectedContentLength==bodyCount 判「头是否可信」：
+            //   CFNetwork 会把 expected 修正为解压后长度，与失真头文本脱钩。
             headers.removeValue(forKey: "Transfer-Encoding")
             headers.removeValue(forKey: "transfer-encoding")
-            let expected = http?.expectedContentLength ?? -1
-            if expected < 0 || expected != bodyCount {
-                headers.removeValue(forKey: "Content-Length")
-                headers.removeValue(forKey: "content-length")
-            }
+            headers["Content-Length"] = "\(bodyCount)"
+            headers.removeValue(forKey: "content-length")
             // Content-Encoding 无条件剔除：Accept-Encoding 已由本端接管，
             // body 恒为 URLSession 交付的最终明文字节，防止 Python 侧二次解压
             headers.removeValue(forKey: "Content-Encoding")
