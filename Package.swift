@@ -35,9 +35,6 @@ let package = Package(
                 // 离线运行时：pyodide-core + numpy/pandas/matplotlib 依赖闭包（~30MB）
                 // 由 Scripts/fetch-pyodide.sh 生成，随包提交
                 .copy("Resources/pyodide-runtime"),
-                // 全新安装时释放到 Documents 的 persist 预装种子（tushare
-                // + websocket_client），保证首次启动开箱即用
-                .copy("Resources/pyodide_persist_seed.zip"),
             ]
         ),
         // 端到端冒烟测试：在 macOS 上驱动真实 WKWebView 走完整离线链路

@@ -148,9 +148,11 @@ public final class PyodideBridge: NSObject, ObservableObject {
         let zipURL = FileManager.default
             .urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("pyodide_persist.zip")
-        // 全新安装：Documents 无持久镜像时从 bundle 释放预装种子
-        // （tushare + websocket_client，~240KB），保证开箱即用；
-        // 已有镜像（覆盖安装/运行回写）不动
+        // 全新安装预装机制：Documents 无持久镜像时，若 bundle 提供
+        // persist 种子（Resources/pyodide_persist_seed.zip，由运行态
+        // 镜像按 RECORD 瘦身而成）则释放，保证预装包开箱即用；已有
+        // 镜像（覆盖安装/运行回写）不动。当前无种子资产（tushare 等
+        // 由用户按需 pip install），需要预装时放入该 zip 即生效
         if !FileManager.default.fileExists(atPath: zipURL.path),
            let seed = Bundle.module.url(forResource: "pyodide_persist_seed", withExtension: "zip") {
             do {
