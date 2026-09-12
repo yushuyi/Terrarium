@@ -193,24 +193,19 @@ async function runPython(id, code) {
     // 远不会被自动加载，冷启动首跑必 ModuleNotFoundError。此处补一环：
     // 识别用户 import 的 persist 包，读其 dist-info/METADATA 的
     // Requires-Dist，与 lockfile 求交后 loadPackage（幂等、离线、全 bundle）
-    const dbg = (m) => { if (currentRunId) post({ kind: "stderr", id: currentRunId, line: "[persistdeps] " + m }); };
     try {
-      dbg("阶段1: 开始");
       const persistDeps = new Set();
       const fsEntries = pyodide.FS.readdir("/persist/site-packages").filter(
         (e) => e.endsWith(".dist-info")
       );
-      dbg("阶段2: dist-info=" + JSON.stringify(fsEntries));
       const imported = new Set();
       for (const m of code.matchAll(/^\s*(?:import|from)\s+([A-Za-z_][\w.]*)/gm)) {
         imported.add(m[1].split(".")[0].toLowerCase());
       }
-      dbg("阶段3: imported=" + JSON.stringify([...imported]));
       for (const name of imported) {
         const di = fsEntries.find(
           (e) => e.toLowerCase().startsWith(name + "-") || e.toLowerCase().replace(/_/g, "-").startsWith(name.replace(/_/g, "-") + "-")
         );
-        dbg("阶段4: name=" + name + " di=" + (di || "无"));
         if (!di) continue;
         try {
           const meta = pyodide.FS.readFile(
@@ -241,11 +236,9 @@ async function runPython(id, code) {
         "crypto": "pycryptodome",
         "attr": "attrs",
       };
-      dbg("阶段5: deps=" + JSON.stringify([...persistDeps]));
       for (const dep of persistDeps) {
         const canonical = DEP_ALIASES[dep] || dep;
         if (pyodide.loadedPackages[canonical] || pyodide.loadedPackages[dep]) continue;
-        dbg("阶段6: loadPackage " + canonical);
         try {
           await pyodide.loadPackage(canonical, {
             messageCallback: (m) => {
