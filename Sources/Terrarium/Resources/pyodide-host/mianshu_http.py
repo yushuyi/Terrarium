@@ -189,76 +189,81 @@ def _install_class(cls, scheme):
     cls.getresponse = getresponse
 
 
-def _patch_urllib3_connection_cls():
-    """urllib3 2.x 的 HTTPConnection.getresponse 含无守卫的
-    self.sock.settimeout（沙箱内 sock 恒为 None，必炸 AttributeError）。
+def _make_pool_cls(base_cls, scheme):
+    """构造连接池专用连接类（防弹方案）。
 
-    按内置版本（2.5.0）逐字复刻该函数、去掉 sock 访问，替换之；
-    try/except 防未来版本漂移（漂移时 requests 链路失效但不崩）。
+    为什么不用类属性补丁：真机探查证实 urllib3.connection 可能被执行
+    两次（loadPackage 安装与 import 时序），connectionpool 持有的旧类
+    对象与 sys.modules 里的新类对象不是同一个——对后者打补丁，前者
+    照走原版 getresponse（含无守卫 sock.settimeout，必炸）。
+
+    直接以「池当前指向的类」为基类派生子类并显式赋给 ConnectionCls：
+    - request()/_response_options 等编排全部继承 urllib3 原类
+    - getresponse 显式调 http.client.HTTPConnection 的补丁版（不经 MRO，
+      绕开 urllib3 原版的无守卫 sock.settimeout），并复刻其响应组装
+      （连接层必须返回 urllib3.response.HTTPResponse，池才认）
+    - https 的 connect() 置空（沙箱无 socket，TLS 由原生 URLSession 完成）
     """
-    try:
-        import urllib3.connection as _uconn
-        from urllib3._collections import HTTPHeaderDict as _HeaderDict
-        from urllib3.response import HTTPResponse as _U3Response
-    except Exception:
-        return
+    from http.client import HTTPConnection as _BaseHTTPConnection
 
-    def _u3_getresponse(self):
-        if getattr(self, "_response_options", None) is None:
-            from urllib3.exceptions import ResponseNotReady
+    class _MSConnection(base_cls):
+        def getresponse(self):
+            if getattr(self, "_response_options", None) is None:
+                from urllib3.exceptions import ResponseNotReady
 
-            raise ResponseNotReady()
-        resp_options = self._response_options
-        self._response_options = None
-        httplib_response = super(_uconn.HTTPConnection, self).getresponse()
-        headers = _HeaderDict(httplib_response.msg.items())
-        return _U3Response(
-            body=httplib_response,
-            headers=headers,
-            status=httplib_response.status,
-            version=httplib_response.version,
-            version_string=getattr(self, "_http_vsn_str", "HTTP/?"),
-            reason=httplib_response.reason,
-            preload_content=resp_options.preload_content,
-            decode_content=resp_options.decode_content,
-            original_response=httplib_response,
-            enforce_content_length=resp_options.enforce_content_length,
-            request_method=resp_options.request_method,
-            request_url=resp_options.request_url,
-        )
+                raise ResponseNotReady()
+            resp_options = self._response_options
+            self._response_options = None
+            # 显式调 http.client 基类补丁版（返回 stdlib HTTPResponse）
+            httplib_response = _BaseHTTPConnection.getresponse(self)
+            try:
+                from urllib3._collections import HTTPHeaderDict as _HeaderDict
+                from urllib3.response import HTTPResponse as _U3Response
+            except Exception:
+                return httplib_response
+            headers = _HeaderDict(httplib_response.msg.items())
+            return _U3Response(
+                body=httplib_response,
+                headers=headers,
+                status=httplib_response.status,
+                version=httplib_response.version,
+                version_string=getattr(self, "_http_vsn_str", "HTTP/?"),
+                reason=httplib_response.reason,
+                preload_content=resp_options.preload_content,
+                decode_content=resp_options.decode_content,
+                original_response=httplib_response,
+                enforce_content_length=resp_options.enforce_content_length,
+                request_method=resp_options.request_method,
+                request_url=resp_options.request_url,
+            )
 
-    try:
-        _uconn.HTTPConnection.getresponse = _u3_getresponse
-    except Exception:
-        pass
+    if scheme == "https":
+        def _connect(self, *a, **k):
+            pass  # 沙箱无 socket；连接由原生代理完成
+
+        _MSConnection.connect = _connect
+    return _MSConnection
 
 
 def _restore_urllib3():
-    """换回 urllib3 的标准连接类。
+    """把连接池的 ConnectionCls 换成本模块的代理子类。
 
     urllib3/__init__.py 在 emscripten 平台 import 时自动执行
-    inject_into_urllib3()，把连接池的 ConnectionCls 换成浏览器 XHR
-    实现（受 CORS 限制）。connectionpool 模块命名空间还保留着注入前
-    导入的原始连接类（其基类已被本模块打补丁），换回即可。
+    inject_into_urllib3()，把 ConnectionCls 换成浏览器 XHR 实现（受
+    CORS 限制）。connectionpool 命名空间保留着注入前的原始连接类，
+    以其为基类派生代理子类后直接赋值（见 _make_pool_cls 注释）。
     """
+    global _ms_https_cls
     try:
         import urllib3.connectionpool as _cp
 
-        _cp.HTTPConnectionPool.ConnectionCls = _cp.HTTPConnection
-        if _ms_https_cls is not None:
+        _cp.HTTPConnectionPool.ConnectionCls = _make_pool_cls(_cp.HTTPConnection, "http")
+        https_base = _cp.HTTPSConnection
+        if https_base is None or getattr(https_base, "__name__", "") == "DummyConnection":
             # ssl 缺失时 urllib3 的 HTTPSConnection 是 DummyConnection，
-            # 不能作为连接类；换成本模块的替身
-            _cp.HTTPSConnectionPool.ConnectionCls = _ms_https_cls
-        else:
-            _cp.HTTPSConnectionPool.ConnectionCls = _cp.HTTPSConnection
-    except Exception:
-        pass
-    # https 池 _validate_conn 会在发请求前触发真 socket 的 connect()
-    # ——沙箱无 socket，连接由原生代理完成，置为空操作
-    try:
-        import urllib3.connectionpool as _cp2
-
-        _cp2.HTTPSConnection.connect = lambda self, *a, **k: None
+            # 以本模块替身为基类
+            https_base = _ms_https_cls or _StdHTTPSConnection or _cp.HTTPConnection
+        _cp.HTTPSConnectionPool.ConnectionCls = _make_pool_cls(https_base, "https")
     except Exception:
         pass
 
@@ -277,7 +282,6 @@ def install():
 
         _install_class(_MSHTTPSConnection, "https")
         _ms_https_cls = _MSHTTPSConnection
-    _restore_urllib3()
 
 
 def ensure():
@@ -286,8 +290,7 @@ def ensure():
     bootstrap 时 urllib3 尚未加载，restore 无事可做；用户脚本 import
     触发 urllib3 装载时会重新执行 inject_into_urllib3，把连接类换回
     浏览器 XHR 实现。此处在 loadPackagesFromImports 之后、用户代码
-    之前再还原一次。
+    之前再赋值一次。连接池在请求时才读 ConnectionCls，赋值即生效。
     """
     if "urllib3" in __import__("sys").modules:
-        _patch_urllib3_connection_cls()
         _restore_urllib3()
