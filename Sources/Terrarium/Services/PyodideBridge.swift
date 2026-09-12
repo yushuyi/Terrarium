@@ -22,9 +22,14 @@
 //
 
 import Foundation
+import os
 import WebKit
 
 @MainActor
+public enum Log {
+    public static let pyodide = OSLog(subsystem: "com.yushuyi.MianshuAgentClient", category: "Pyodide")
+}
+
 public final class PyodideBridge: NSObject, ObservableObject {
 
     public static let shared = PyodideBridge()
@@ -129,6 +134,74 @@ public final class PyodideBridge: NSObject, ObservableObject {
             return
         }
         webView.load(URLRequest(url: url))
+        seedPersistMirror()
+    }
+
+    /// 把 Documents 里的持久化镜像（pip 已装包的 zip）注入运行时。
+    /// host.js 的 bootstrap 会等待 __MS_PERSIST_SEEDED__（5s 超时兜底），
+    /// 本方法轮询页面 JS 就绪后分块注入，注入完成置位。
+    private func seedPersistMirror() {
+        let zipURL = FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("pyodide_persist.zip")
+        let data = (try? Data(contentsOf: zipURL))
+        let b64 = data?.base64EncodedString() ?? ""
+        os_log("[Pyodide] seedPersistMirror 启动 b64len=%{public}lu", log: Log.pyodide, UInt(b64.count))
+        Task { @MainActor [weak self] in
+            // 等 host.js 设出等待标志（页面 JS 环境就绪）；最多等 30s
+            var probes = 0
+            for _ in 0..<150 {
+                guard let self else { return }
+                let probe = await self.evaluate("typeof window.__MS_PERSIST_WAIT__")
+                probes += 1
+                if probe == "boolean" { break }
+                if probes % 25 == 0 {
+                    os_log("[Pyodide] seedPersist 轮询中 %{public}d probe=%{public}@", log: Log.pyodide, probes, probe)
+                }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+            guard let self, self.webView != nil else { return }
+            os_log("[Pyodide] seedPersist 轮询结束 %{public}d 次开始注入", log: Log.pyodide, probes)
+            // 分块注入，单次 evaluate 传 MB 级字符串易触发 WebKit 上限
+            var injected = 0
+            if !b64.isEmpty {
+                var idx = b64.startIndex
+                while idx < b64.endIndex {
+                    let end = b64.index(idx, offsetBy: 1_000_000, limitedBy: b64.endIndex) ?? b64.endIndex
+                    let chunk = String(b64[idx..<end])
+                    let op = injected == 0 ? "=" : "+="
+                    _ = await self.evaluate(
+                        "window.__MS_PERSIST_B64__ \(op) '\(chunk)'; 'ok'"
+                    )
+                    injected += 1
+                    idx = end
+                }
+            }
+            _ = await self.evaluate(
+                "window.__MS_PERSIST_SEEDED__ = true; window.dispatchEvent(new Event('ms-persist-ready')); 'seeded'"
+            )
+            os_log("[Pyodide] 持久化镜像注入完成 镜像=%{public}@ 块数=%{public}d", log: Log.pyodide, b64.isEmpty ? "无" : "有", injected)
+        }
+    }
+
+    /// evaluateJavaScript 的 async 封装；失败/超时返回空串（注入是尽力而为）。
+    /// 页面 navigation 未 commit 时 completionHandler 可能永不回调，
+    /// 必须用超时竞速兜底，否则轮询 Task 卡死。
+    @MainActor
+    private func evaluate(_ script: String) async -> String {
+        await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            var finished = false
+            webView?.evaluateJavaScript(script) { result, _ in
+                guard !finished else { return }
+                finished = true
+                cont.resume(returning: (result as? String) ?? "")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                guard !finished else { return }
+                finished = true
+                cont.resume(returning: "")
+            }
+        }
     }
 
     /// 预热：提前触发 bootstrap（wasm 编译 + micropip 就绪），首次执行零等待。
@@ -286,6 +359,15 @@ public final class PyodideBridge: NSObject, ObservableObject {
             guard let id = body["id"] as? String,
                   let cont = pendingRun.removeValue(forKey: id) else { return }
             outputHandlers.removeValue(forKey: id)
+            // pip 持久化镜像：写入 Documents，下次启动 bootstrap 注回运行时。
+            // WebKit 对自定义 scheme 页面的 IndexedDB 是临时的，IDBFS 不可依赖。
+            if let b64 = body["persistB64"] as? String, !b64.isEmpty,
+               let data = Data(base64Encoded: b64) {
+                let url = FileManager.default
+                    .urls(for: .documentDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("pyodide_persist.zip")
+                try? data.write(to: url)
+            }
             cont.resume(returning: PyodideRunResult(
                 stdout: (body["stdout"] as? String) ?? "",
                 stderr: (body["stderr"] as? String) ?? "",

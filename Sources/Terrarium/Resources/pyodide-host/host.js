@@ -18,6 +18,7 @@ let progressBuf = [];
 let currentRunId = null;
 // 启动期警告（ssl/代理注入失败等）——首跑时经 stderr 流出，避免静默
 let bootWarnings = [];
+let persistB64 = null; // pip 流程输出的持久化镜像（随 runResult 回传）
 
 // Persistent storage path inside Pyodide's emscripten FS. We mount IDBFS
 // here so installed packages survive WebView reloads (and thus app
@@ -45,6 +46,11 @@ async function bootstrap() {
       // Scripts/fetch-pyodide.sh 锁定（0.29.4），与 bundle 内容一致。
       indexURL: "pyodide-local://bundle/",
       stdout: (text) => {
+        // pip 持久化镜像：捕获后随 runResult 回传，不进终端流（行长达 MB 级）
+        if (text.startsWith("__TERRARIUM_PERSIST_B64__:")) {
+          persistB64 = text.slice("__TERRARIUM_PERSIST_B64__:".length).trim();
+          return;
+        }
         stdoutBuf += text + "\n";
         // 流式转发给 Swift（__TERRARIUM_IMG__ 标记行留给 runResult，
         // 图像渲染走专门通道，不刷终端）
@@ -60,11 +66,46 @@ async function bootstrap() {
       },
     });
 
-    // Mount IDBFS at /persist and pull any previously-synced packages
-    // off disk. `populate=true` loads from IndexedDB into the FS.
+    // /persist 为普通 MEMFS 目录：已安装包的文件由 pip 流程复制至此，
+    // 跨启动经「原生镜像」恢复——WebKit 对自定义 scheme 页面的 IndexedDB
+    // 是临时的（IDBFS 方案实测同容器冷启动即丢，且无任何报错），不可依赖。
     pyodide.FS.mkdir(PERSIST_DIR);
-    pyodide.FS.mount(pyodide.FS.filesystems.IDBFS, {}, PERSIST_DIR);
-    await syncFS(true);
+
+    // 等待 Swift 注入持久化镜像（window.__MS_PERSIST_B64__，见
+    // PyodideBridge.seedPersist）。旧宿主/无镜像时 5s 超时放行。
+    // __MS_PERSIST_WAIT__ 是 Swift 轮询的「页面 JS 已就绪」信号。
+    window.__MS_PERSIST_WAIT__ = true;
+    try {
+      await new Promise((resolve) => {
+        if (window.__MS_PERSIST_SEEDED__) return resolve();
+        const started = performance.now();
+        const t = setInterval(() => {
+          if (window.__MS_PERSIST_SEEDED__ || performance.now() - started > 15000) {
+            clearInterval(t);
+            resolve();
+          }
+        }, 100);
+      });
+    } catch (_) {}
+    bootWarnings.push(
+      "注入等待结束: wait=" + String(window.__MS_PERSIST_WAIT__) +
+      " seeded=" + String(window.__MS_PERSIST_SEEDED__) +
+      " b64len=" + String((window.__MS_PERSIST_B64__ || "").length)
+    );
+    if (window.__MS_PERSIST_B64__) {
+      try {
+        await pyodide.runPythonAsync(
+          "import base64, io, zipfile\n" +
+          "_b64 = __import__('js').window.__MS_PERSIST_B64__ or ''\n" +
+          "_z = zipfile.ZipFile(io.BytesIO(base64.b64decode(_b64)))\n" +
+          "_n = len(_z.namelist())\n" +
+          "_z.extractall('/persist')\n" +
+          "print('[pyodide] 已从原生镜像恢复 ' + str(_n) + ' 个持久化文件')\n"
+        );
+      } catch (e) {
+        bootWarnings.push("持久化镜像恢复失败: " + String(e));
+      }
+    }
 
     // Make sure /persist/site-packages exists, then put it on sys.path
     // before any user import resolution happens.
@@ -140,6 +181,7 @@ function resetBuffers() {
   stdoutBuf = "";
   stderrBuf = "";
   progressBuf = [];
+  persistB64 = null;
 }
 
 async function runPython(id, code) {
@@ -192,41 +234,10 @@ async function runPython(id, code) {
   };
 
   try {
-    try {
-      await runUser();
-    } catch (runErr) {
-      // micropip 纯包兜底：缺失模块不在离线 bundle（如 tushare）时，
-      // 从 PyPI 拉纯 wheel 安装（需网络），destination 指向 /persist
-      // 使安装跨启动保留；锁表内包的失败是「真缺包」，不在此列也无妨
-      // （micropip 会失败并回传原始错误）。
-      const msg = String(runErr && runErr.message || runErr);
-      const m = /ModuleNotFoundError: No module named '([^']+)'/.exec(msg);
-      if (!m) throw runErr;
-      const missing = m[1].split(".")[0].replace(/-/g, "_");
-      if (currentRunId) {
-        post({ kind: "stderr", id: currentRunId, line: "[pyodide] " + missing + " 不在离线 bundle，尝试 micropip 安装（需网络）…" });
-      }
-      try {
-        await pyodide.loadPackage("micropip");
-        // destination 不被旧版 micropip 支持时退化为默认位置（仅本次会话有效）
-        await pyodide.runPythonAsync(
-          "import micropip\n" +
-          "try:\n" +
-          "    await micropip.install('" + missing + "', destination='/persist/site-packages')\n" +
-          "except TypeError:\n" +
-          "    await micropip.install('" + missing + "')"
-        );
-      } catch (installErr) {
-        if (currentRunId) {
-          post({ kind: "stderr", id: currentRunId, line: "[pyodide] micropip 安装失败: " + String(installErr && installErr.message || installErr) });
-        }
-        throw runErr; // 原始 ModuleNotFoundError 才是用户要看的错误
-      }
-      if (currentRunId) {
-        post({ kind: "stderr", id: currentRunId, line: "[pyodide] " + missing + " 安装完成，重新执行脚本" });
-      }
-      await runUser(); // 二次失败直接向外抛，错误信息真实
-    }
+    // Mac 语义：缺包不自动安装。ModuleNotFoundError 等错误原样抛出，
+    // 由终端呈现真实 traceback（exit 1）；补装依赖走显式 `pip install`
+    // 命令（TerminalBridge 把 pip 转发到本运行时的 micropip）。
+    await runUser();
   } catch (e) {
     exception = String(e && e.message || e);
     exitCode = 1;
@@ -235,7 +246,12 @@ async function runPython(id, code) {
   }
   const durationMs = Math.round(performance.now() - t0);
   // Sync any FS changes the user code made to IDBFS so they persist.
-  try { await syncFS(false); } catch (_) {}
+  try {
+    await syncFS(false);
+  } catch (e) {
+    const msg = "[pyodide] IDBFS sync 失败（本次安装不跨启动）: " + String(e);
+    if (currentRunId) post({ kind: "stderr", id: currentRunId, line: msg });
+  }
   post({
     kind: "runResult",
     id,
@@ -244,6 +260,7 @@ async function runPython(id, code) {
     exception,
     exitCode,
     durationMs,
+    persistB64,
   });
 }
 
