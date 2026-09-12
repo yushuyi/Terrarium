@@ -98,7 +98,11 @@ if _target not in sys.path:
     pyodideReady = true;
     post({ kind: "ready", version: pyodide.version });
   } catch (err) {
-    post({ kind: "bootstrapFailed", error: String(err && err.stack || err) });
+    // JavaScriptCore 的 err.stack 不含 message，必须显式拼上才能定位问题
+    const detail = err instanceof Error
+      ? (err.message || String(err)) + "\n" + (err.stack || "")
+      : String(err);
+    post({ kind: "bootstrapFailed", error: detail });
   }
 }
 
@@ -119,6 +123,20 @@ async function runPython(id, code) {
   let exception = null;
   let exitCode = 0;
   try {
+    // 按 import 自动加载 lockfile 内的包：bundle 内的 wheel 经
+    // pyodide-local:// 离线伺服；未打包的包会 404——捕获后放行，
+    // 让用户代码以明确的 ModuleNotFoundError 失败（后续可接 micropip 兜底）
+    try {
+      await pyodide.loadPackagesFromImports(code, {
+        messageCallback: (m) => {
+          if (currentRunId) post({ kind: "stderr", id: currentRunId, line: String(m) });
+        },
+      });
+    } catch (loadErr) {
+      if (currentRunId) {
+        post({ kind: "stderr", id: currentRunId, line: "[pyodide] 自动加载依赖失败: " + String(loadErr && loadErr.message || loadErr) });
+      }
+    }
     await pyodide.runPythonAsync(code);
     // Jupyter-style auto-show: if the user's code created matplotlib
     // figures but never called `.show()` or saved them, auto-render

@@ -37,5 +37,12 @@ let package = Package(
                 .copy("Resources/pyodide-runtime"),
             ]
         ),
+        // 端到端冒烟测试：在 macOS 上驱动真实 WKWebView 走完整离线链路
+        // （scheme 伺服 → Pyodide bootstrap → 执行代码 → 流式输出）
+        .testTarget(
+            name: "TerrariumTests",
+            dependencies: ["Terrarium"],
+            path: "Tests/TerrariumTests"
+        ),
     ]
 )

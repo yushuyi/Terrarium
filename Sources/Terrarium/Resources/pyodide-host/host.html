@@ -4,10 +4,12 @@
     <meta charset="utf-8">
     <title>Terrarium Pyodide Host</title>
     <!-- 离线模式：Pyodide 运行时由 App Bundle 提供，经自定义 scheme
-         pyodide-local:// 由 PyodideSchemeHandler 伺服（相对路径 ../bundle/
-         解析到 pyodide-local://bundle/，与宿主页全同源）。
+         pyodide-local:// 由 PyodideSchemeHandler 伺服。
+         注意必须用绝对 scheme URL：本页位于 pyodide-local://host/ 下，
+         相对路径 ../bundle/ 只会弹掉路径段而非 authority，解析成
+         pyodide-local://host/bundle/… 导致 404。
          bundle 内容由 Scripts/fetch-pyodide.sh 生成并随包分发。 -->
-    <script src="../bundle/pyodide.js"></script>
+    <script src="pyodide-local://bundle/pyodide.js"></script>
   </head>
   <body>
     <script src="host.js"></script>

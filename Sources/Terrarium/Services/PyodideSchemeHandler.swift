@@ -49,6 +49,8 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
         let fileURL = base.appendingPathComponent(String(relative.dropFirst()))
         guard fileURL.standardizedFileURL.path.hasPrefix(base.standardizedFileURL.path),
               FileManager.default.fileExists(atPath: fileURL.path) else {
+            // 404 是离线链路排查的关键线索，务必留日志
+            NSLog("[PyodideSchemeHandler] 404: \(url.absoluteString)")
             respond(task, status: 404, body: Data("pyodide-local: not found: \(url.lastPathComponent)".utf8))
             return
         }
