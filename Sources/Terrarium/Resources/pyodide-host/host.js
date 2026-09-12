@@ -20,21 +20,15 @@ let currentRunId = null;
 let bootWarnings = [];
 let persistB64 = null; // pip 流程输出的持久化镜像（随 runResult 回传）
 
-// Persistent storage path inside Pyodide's emscripten FS. We mount IDBFS
-// here so installed packages survive WebView reloads (and thus app
-// launches). Site-packages, downloaded wheels, anything micropip wrote.
+// Persistent storage path inside Pyodide's emscripten FS. Installed packages
+// land here in-session; across launches they come back via the native mirror
+// (Swift injects Documents/pyodide_persist.zip, see seedPersistMirror).
 const PERSIST_DIR = "/persist";
 
 function post(payload) {
   if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.terrariumPyodide) {
     window.webkit.messageHandlers.terrariumPyodide.postMessage(payload);
   }
-}
-
-async function syncFS(populate) {
-  return new Promise((resolve, reject) => {
-    pyodide.FS.syncfs(populate, (err) => (err ? reject(err) : resolve()));
-  });
 }
 
 async function bootstrap() {
@@ -72,7 +66,7 @@ async function bootstrap() {
     pyodide.FS.mkdir(PERSIST_DIR);
 
     // 等待 Swift 注入持久化镜像（window.__MS_PERSIST_B64__，见
-    // PyodideBridge.seedPersist）。旧宿主/无镜像时 5s 超时放行。
+    // PyodideBridge.seedPersistMirror）。旧宿主/无镜像时 15s 超时放行。
     // __MS_PERSIST_WAIT__ 是 Swift 轮询的「页面 JS 已就绪」信号。
     window.__MS_PERSIST_WAIT__ = true;
     try {
@@ -87,11 +81,10 @@ async function bootstrap() {
         }, 100);
       });
     } catch (_) {}
-    bootWarnings.push(
-      "注入等待结束: wait=" + String(window.__MS_PERSIST_WAIT__) +
-      " seeded=" + String(window.__MS_PERSIST_SEEDED__) +
-      " b64len=" + String((window.__MS_PERSIST_B64__ || "").length)
-    );
+    if (!window.__MS_PERSIST_SEEDED__) {
+      // 仅异常时告警：Swift 侧轮询/注入未在窗口内置位
+      bootWarnings.push("持久化镜像注入等待超时（宿主未置 SEEDED）");
+    }
     if (window.__MS_PERSIST_B64__) {
       try {
         await pyodide.runPythonAsync(
@@ -104,6 +97,9 @@ async function bootstrap() {
         );
       } catch (e) {
         bootWarnings.push("持久化镜像恢复失败: " + String(e));
+      } finally {
+        // 释放 JS 侧大字符串（恢复已完成/已失败，内存不再需要）
+        window.__MS_PERSIST_B64__ = null;
       }
     }
 
@@ -112,7 +108,6 @@ async function bootstrap() {
     const sitePackages = PERSIST_DIR + "/site-packages";
     if (!pyodide.FS.analyzePath(sitePackages).exists) {
       pyodide.FS.mkdir(sitePackages);
-      await syncFS(false);
     }
     pyodide.runPython(`
 import sys
@@ -123,20 +118,6 @@ if "${sitePackages}" not in sys.path:
     // Pre-load micropip — it's tiny (~150 KB) and we use it for every
     // `%pip install`. Without this, the first install pays a load tax.
     await pyodide.loadPackage("micropip");
-
-    // Override micropip's install target to /persist/site-packages so
-    // installed wheels survive the FS reset on reload.
-    pyodide.runPython(`
-import micropip
-import micropip._compat as _mc
-
-# Force micropip to write into the persistent dir. Without this, wheels
-# land in the in-memory site-packages and vanish on reload.
-import sys
-_target = "${sitePackages}"
-if _target not in sys.path:
-    sys.path.insert(0, _target)
-`);
 
     // ssl：http.client.HTTPSConnection 的依赖包。沙箱内不做真 TLS
     // （由原生 URLSession 完成），但类结构必须存在，否则 urllib3 降级
@@ -204,7 +185,8 @@ async function runPython(id, code) {
   const loadFromLockfile = async () => {
     // 按 import 自动加载 lockfile 内的包：bundle 内的 wheel 经
     // pyodide-local:// 离线伺服；未打包的包会 404——捕获后放行，
-    // 让用户代码以明确的 ModuleNotFoundError 失败（再由 micropip 兜底）
+    // 让用户代码以明确的 ModuleNotFoundError 失败（Mac 语义：宿主不自动安装，
+    // 由用户显式 pip install）
     try {
       await pyodide.loadPackagesFromImports(code, {
         messageCallback: (m) => {
@@ -245,13 +227,6 @@ async function runPython(id, code) {
     currentRunId = null;
   }
   const durationMs = Math.round(performance.now() - t0);
-  // Sync any FS changes the user code made to IDBFS so they persist.
-  try {
-    await syncFS(false);
-  } catch (e) {
-    const msg = "[pyodide] IDBFS sync 失败（本次安装不跨启动）: " + String(e);
-    if (currentRunId) post({ kind: "stderr", id: currentRunId, line: msg });
-  }
   post({
     kind: "runResult",
     id,
@@ -350,6 +325,8 @@ async function installPackage(id, pkg) {
       if (!/Can't find a package/i.test(m) && !/not found/i.test(m) && !/404/.test(m)) {
         throw loadErr;
       }
+      // 注意：此 GUI 安装路径装进 purelib，不产出持久化镜像，重启后包丢失
+      // （与终端 pip install 语义不一致；当前无调用方，保留待统一）
       post({ kind: "installProgress", id, line: `  Package not in local bundle, falling back to PyPI…` });
     }
 
@@ -404,7 +381,7 @@ _v
       if (v) version = v;
     } catch (_) {}
 
-    try { await syncFS(false); } catch (_) {}
+
 
     post({ kind: "installProgress", id, line: `Successfully installed ${pkg}-${version}` });
     post({ kind: "installResult", id, pkg, ok: true, version });
@@ -429,7 +406,7 @@ pkg_name = ${JSON.stringify(pkg)}
 target = pkg_name.lower().replace("-", "_")
 
 # Same dirs listPackages scans — Pyodide's own site-packages PLUS our
-# IDBFS mount. We have to clean both so an uninstall actually frees the
+# /persist copy. We have to clean both so an uninstall actually frees the
 # bytes the user expects (whichever dir the package landed in).
 search_dirs = []
 for key in ("purelib", "platlib"):
@@ -472,8 +449,24 @@ for mod in list(sys.modules.keys()):
     if mod == target or mod.startswith(target + "."):
         sys.modules.pop(mod, None)
 `);
-    try { await syncFS(false); } catch (_) {}
-    post({ kind: "uninstallResult", id, pkg, ok: true });
+    // 镜像重生成：/persist 已清除该包，按剩余内容重建 zip 回传 Swift 覆写，
+    // 否则 Documents 里的旧镜像会让被卸载的包在重启后「复活」
+    persistB64 = "";
+    await pyodide.runPythonAsync(`
+import io as _io, os as _os, zipfile as _zip, base64 as _b64
+_buf = _io.BytesIO()
+_n = 0
+_z = _zip.ZipFile(_buf, 'w', _zip.ZIP_DEFLATED)
+for _root, _dirs, _files in _os.walk('${PERSIST_DIR}/site-packages'):
+    for _f in _files:
+        _p = _os.path.join(_root, _f)
+        _z.write(_p, _os.path.relpath(_p, '${PERSIST_DIR}'))
+        _n += 1
+_z.close()
+if _n:
+    print('__TERRARIUM_PERSIST_B64__:' + _b64.b64encode(_buf.getvalue()).decode())
+`);
+    post({ kind: "uninstallResult", id, pkg, ok: true, persistB64 });
   } catch (err) {
     post({ kind: "uninstallResult", id, pkg, ok: false, error: String(err) });
   }
@@ -487,9 +480,9 @@ async function listPackages(id) {
   try {
     // Pyodide's `loadPackage` installs into its own internal site-
     // packages dir (`sysconfig.get_paths()["purelib"]`), NOT into our
-    // /persist IDBFS mount. micropip with no `target` argument also
-    // lands there. So we have to scan BOTH locations to find every
-    // user-installed package.
+    // /persist copy. Terminal-side pip installs land in /persist too.
+    // So we have to scan BOTH locations to find every user-installed
+    // package.
     //
     // We also filter out packages that ship as part of Pyodide's base
     // distribution (the ~30 things loaded at bootstrap — micropip,
@@ -502,7 +495,7 @@ async function listPackages(id) {
 import importlib.metadata as _md, json, os, sys, sysconfig
 from pathlib import Path
 
-# Every site-packages dir Python knows about (Pyodide's + our IDBFS mount).
+# Every site-packages dir Python knows about (Pyodide's + /persist copy).
 search_dirs = []
 for key in ("purelib", "platlib"):
     p = sysconfig.get_paths().get(key)
@@ -575,8 +568,7 @@ if os.path.isdir(persist):
         except Exception:
             pass
 `);
-    try { await syncFS(false); } catch (_) {}
-    post({ kind: "clearResult", id, ok: true });
+    post({ kind: "clearResult", id, ok: true, persistB64: "" });
   } catch (err) {
     post({ kind: "clearResult", id, ok: false, error: String(err) });
   }

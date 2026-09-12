@@ -137,8 +137,12 @@ public final class PyodideBridge: NSObject, ObservableObject {
         seedPersistMirror()
     }
 
+    /// 注入任务代数：loadHostPage 每次递增；旧 Task 发现代数过期即退出，
+    /// 避免超时重载后新旧两个 Task 交错写同一 JS 变量。
+    private var seedGeneration = 0
+
     /// 把 Documents 里的持久化镜像（pip 已装包的 zip）注入运行时。
-    /// host.js 的 bootstrap 会等待 __MS_PERSIST_SEEDED__（5s 超时兜底），
+    /// host.js 的 bootstrap 会等待 __MS_PERSIST_SEEDED__（15s 超时兜底），
     /// 本方法轮询页面 JS 就绪后分块注入，注入完成置位。
     private func seedPersistMirror() {
         let zipURL = FileManager.default
@@ -147,21 +151,33 @@ public final class PyodideBridge: NSObject, ObservableObject {
         let data = (try? Data(contentsOf: zipURL))
         let b64 = data?.base64EncodedString() ?? ""
         os_log("[Pyodide] seedPersistMirror 启动 b64len=%{public}lu", log: Log.pyodide, UInt(b64.count))
+        seedGeneration += 1
+        let generation = seedGeneration
         Task { @MainActor [weak self] in
-            // 等 host.js 设出等待标志（页面 JS 环境就绪）；最多等 30s
+            // 等 host.js 设出等待标志（页面 JS 环境就绪）；每次 probe 最多
+            // 1s（超时竞速），60 次为预算上限，页面始终未就绪则放弃注入
             var probes = 0
-            for _ in 0..<150 {
+            var sawReady = false
+            while probes < 60 {
                 guard let self else { return }
+                guard generation == self.seedGeneration else {
+                    os_log("[Pyodide] seedPersist 代数过期（页面已重载），放弃注入", log: Log.pyodide)
+                    return
+                }
                 let probe = await self.evaluate("typeof window.__MS_PERSIST_WAIT__")
                 probes += 1
-                if probe == "boolean" { break }
-                if probes % 25 == 0 {
-                    os_log("[Pyodide] seedPersist 轮询中 %{public}d probe=%{public}@", log: Log.pyodide, probes, probe)
+                if probe == "boolean" {
+                    sawReady = true
+                    break
                 }
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
             guard let self, self.webView != nil else { return }
-            os_log("[Pyodide] seedPersist 轮询结束 %{public}d 次开始注入", log: Log.pyodide, probes)
+            guard generation == self.seedGeneration, sawReady else {
+                os_log("[Pyodide] seedPersist 页面未就绪或已重载（%{public}ld 次探针），跳过注入", log: Log.pyodide, probes)
+                return
+            }
+            os_log("[Pyodide] seedPersist 页面就绪（%{public}ld 次探针）开始注入", log: Log.pyodide, probes)
             // 分块注入，单次 evaluate 传 MB 级字符串易触发 WebKit 上限
             var injected = 0
             if !b64.isEmpty {
@@ -177,10 +193,42 @@ public final class PyodideBridge: NSObject, ObservableObject {
                     idx = end
                 }
             }
-            _ = await self.evaluate(
-                "window.__MS_PERSIST_SEEDED__ = true; window.dispatchEvent(new Event('ms-persist-ready')); 'seeded'"
+            // M3 校验：比对页面侧实际长度，任何一块 evaluate 丢失都能在此暴露
+            let got = await self.evaluate(
+                "String(window.__MS_PERSIST_B64__ ? window.__MS_PERSIST_B64__.length : 0)"
             )
-            os_log("[Pyodide] 持久化镜像注入完成 镜像=%{public}@ 块数=%{public}d", log: Log.pyodide, b64.isEmpty ? "无" : "有", injected)
+            if got == String(b64.count) {
+                os_log("[Pyodide] 持久化镜像注入完成 镜像=%{public}@ 块数=%{public}d 长度校验一致",
+                       log: Log.pyodide, b64.isEmpty ? "无" : "有", Int32(injected))
+            } else {
+                os_log("[Pyodide] 持久化镜像注入长度不符 期望=%{public}ld 实际=%{public}@（本次会话可能无包）",
+                       log: Log.pyodide, b64.count, got.isEmpty ? "0" : got)
+            }
+            _ = await self.evaluate("window.__MS_PERSIST_SEEDED__ = true; 'seeded'")
+        }
+    }
+
+    /// 持久化镜像落盘：b64 非空 → 原子写入 Documents（仅接受 zip 魔数，
+    /// 防标记行伪造/数据损坏后覆盖好镜像）；b64 空串 → 删除镜像（卸载/清空同步）。
+    private func storePersistMirror(base64: String) {
+        let url = FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("pyodide_persist.zip")
+        guard !base64.isEmpty else {
+            try? FileManager.default.removeItem(at: url)
+            os_log("[Pyodide] 持久化镜像已删除（卸载/清空同步）", log: Log.pyodide)
+            return
+        }
+        guard let data = Data(base64Encoded: base64),
+              data.starts(with: [0x50, 0x4B]) else { // PK zip 魔数
+            os_log("[Pyodide] 持久化镜像数据无效（解码失败或非 zip），保留原镜像", log: Log.pyodide)
+            return
+        }
+        do {
+            try data.write(to: url, options: .atomic)
+            os_log("[Pyodide] 持久化镜像已落盘 %{public}ld 字节", log: Log.pyodide, data.count)
+        } catch {
+            os_log("[Pyodide] 持久化镜像写入失败: %{public}@", log: Log.pyodide, String(describing: error))
         }
     }
 
@@ -361,12 +409,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
             outputHandlers.removeValue(forKey: id)
             // pip 持久化镜像：写入 Documents，下次启动 bootstrap 注回运行时。
             // WebKit 对自定义 scheme 页面的 IndexedDB 是临时的，IDBFS 不可依赖。
-            if let b64 = body["persistB64"] as? String, !b64.isEmpty,
-               let data = Data(base64Encoded: b64) {
-                let url = FileManager.default
-                    .urls(for: .documentDirectory, in: .userDomainMask)[0]
-                    .appendingPathComponent("pyodide_persist.zip")
-                try? data.write(to: url)
+            if let b64 = body["persistB64"] as? String {
+                storePersistMirror(base64: b64)
             }
             cont.resume(returning: PyodideRunResult(
                 stdout: (body["stdout"] as? String) ?? "",
@@ -396,6 +440,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
         case "uninstallResult":
             guard let id = body["id"] as? String,
                   let cont = pendingUninstall.removeValue(forKey: id) else { return }
+            // 卸载后镜像重生成：非空覆写、空串删除（防止被卸包重启复活）
+            if let b64 = body["persistB64"] as? String {
+                storePersistMirror(base64: b64)
+            }
             cont.resume(returning: (body["ok"] as? Bool) ?? false)
         case "listResult":
             guard let id = body["id"] as? String,
@@ -411,6 +459,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
         case "clearResult":
             guard let id = body["id"] as? String,
                   let cont = pendingClear.removeValue(forKey: id) else { return }
+            // 全量清空：宿主固定回空串 → 删除 Documents 镜像
+            if let b64 = body["persistB64"] as? String {
+                storePersistMirror(base64: b64)
+            }
             cont.resume(returning: (body["ok"] as? Bool) ?? false)
         default:
             break
