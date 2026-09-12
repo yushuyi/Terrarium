@@ -187,6 +187,53 @@ async function runPython(id, code) {
     // pyodide-local:// 离线伺服；未打包的包会 404——捕获后放行，
     // 让用户代码以明确的 ModuleNotFoundError 失败（Mac 语义：宿主不自动安装，
     // 由用户显式 pip install）
+    // persist 包依赖解析（真机实测缺口）：loadPackagesFromImports 只扫
+    // 用户代码顶层 import，persist 里的纯 py 包（如 tushare，不在
+    // lockfile）会被跳过——其内部依赖（如 pandas/numpy，在 lockfile）永
+    // 远不会被自动加载，冷启动首跑必 ModuleNotFoundError。此处补一环：
+    // 识别用户 import 的 persist 包，读其 dist-info/METADATA 的
+    // Requires-Dist，与 lockfile 求交后 loadPackage（幂等、离线、全 bundle）
+    try {
+      const persistDeps = new Set();
+      const fsEntries = pyodide.FS.readdir("/persist/site-packages").filter(
+        (e) => e.endsWith(".dist-info")
+      );
+      const imported = new Set();
+      for (const m of code.matchAll(/^\s*(?:import|from)\s+([A-Za-z_][\w.]*)/gm)) {
+        imported.add(m[1].split(".")[0].toLowerCase());
+      }
+      for (const name of imported) {
+        const di = fsEntries.find(
+          (e) => e.toLowerCase().startsWith(name + "-") || e.toLowerCase().replace(/_/g, "-").startsWith(name.replace(/_/g, "-") + "-")
+        );
+        if (!di) continue;
+        try {
+          const meta = pyodide.FS.readFile(
+            "/persist/site-packages/" + di + "/METADATA",
+            { encoding: "utf8" }
+          );
+          for (const line of meta.split("\n")) {
+            if (!line.startsWith("Requires-Dist:")) continue;
+            const dep = line.slice(14).trim().split(/[ ;<>=!\[]/)[0];
+            if (dep) persistDeps.add(dep.toLowerCase().replace(/_/g, "-"));
+          }
+        } catch (_) {}
+      }
+      const lockPkgs = pyodide.lockfile && pyodide.lockfile.packages ? pyodide.lockfile.packages : {};
+      const toLoad = [...persistDeps].filter(
+        (d) => lockPkgs[d] && !pyodide.loadedPackages[d]
+      );
+      if (toLoad.length) {
+        await pyodide.loadPackage(toLoad, {
+          messageCallback: (m) => {
+            if (currentRunId) post({ kind: "stderr", id: currentRunId, line: String(m) });
+          },
+        });
+      }
+    } catch (persistErr) {
+      if (currentRunId)
+        post({ kind: "stderr", id: currentRunId, line: "[pyodide] persist 依赖解析失败: " + String(persistErr && persistErr.message || persistErr) });
+    }
     try {
       await pyodide.loadPackagesFromImports(code, {
         messageCallback: (m) => {
