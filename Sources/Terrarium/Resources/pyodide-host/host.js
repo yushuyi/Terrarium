@@ -240,11 +240,7 @@ async function runPython(id, code) {
         const canonical = DEP_ALIASES[dep] || dep;
         if (pyodide.loadedPackages[canonical] || pyodide.loadedPackages[dep]) continue;
         try {
-          await pyodide.loadPackage(canonical, {
-            messageCallback: (m) => {
-              if (currentRunId) post({ kind: "stderr", id: currentRunId, line: String(m) });
-            },
-          });
+          await pyodide.loadPackage(canonical);
         } catch (_) {}
       }
     } catch (persistErr) {
@@ -252,11 +248,10 @@ async function runPython(id, code) {
         post({ kind: "stderr", id: currentRunId, line: "[pyodide] persist 依赖解析失败: " + String(persistErr && persistErr.message || persistErr) });
     }
     try {
-      await pyodide.loadPackagesFromImports(code, {
-        messageCallback: (m) => {
-          if (currentRunId) post({ kind: "stderr", id: currentRunId, line: String(m) });
-        },
-      });
+      // 加载进度（Loading/Loaded）不上屏：终端把 stderr 渲染为红色，
+      // 常规加载进度会造成「报错」观感；失败仍由外层 catch 与后续
+      // ModuleNotFoundError 明确暴露
+      await pyodide.loadPackagesFromImports(code);
     } catch (loadErr) {
       if (currentRunId) {
         post({ kind: "stderr", id: currentRunId, line: "[pyodide] 自动加载依赖失败: " + String(loadErr && loadErr.message || loadErr) });
