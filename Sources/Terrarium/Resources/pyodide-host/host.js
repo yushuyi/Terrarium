@@ -129,26 +129,34 @@ if "${sitePackages}" not in sys.path:
       console.warn("[mianshu_http] ssl 包加载失败:", e);
     }
 
+    // lockfile 映射注入（独立于 mianshu_http）：micropip 对发行版包拼
+    // indexURL 相对 URL（pyodide-local://bundle/<file_name>），bundle 未
+    // 打包的 wheel（scipy 等）404——pip 安装兜底据此把 URL 重定向到官
+    // 方 CDN；deps 供安装侧做依赖闭包展开（BFS 收集全部 URL 一次装）。
+    // 单独 try：mianshu_http 拉取失败不得连坐 lockfile 映射
+    try {
+      const lockResp = await fetch("pyodide-local://bundle/pyodide-lock.json");
+      if (lockResp.ok) {
+        const lock = await lockResp.json();
+        const files = {};
+        const deps = {};
+        for (const [name, info] of Object.entries(lock.packages || {})) {
+          files[name] = info.file_name || "";
+          deps[name] = info.depends || [];
+        }
+        window.__MS_LOCKFILE_FILES__ = files;
+        window.__MS_LOCKFILE_DEPS__ = deps;
+      }
+    } catch (e) {
+      console.warn("[pyodide] lockfile 映射注入失败:", e);
+    }
+
     // mianshu_http：把 http.client 改道原生网络代理（同步桥）。
     // requests/urllib/urllib3 零改动可用；Referer/CORS 限制由原生侧绕过。
     // 注入失败不阻断 bootstrap（纯标准库脚本不需要它）。
     try {
       const modResp = await fetch("pyodide-local://host/mianshu_http.py");
       if (!modResp.ok) throw new Error("fetch 失败: " + modResp.status);
-      // lockfile 文件名映射：micropip 对发行版包拼 indexURL 相对 URL
-      // （pyodide-local://bundle/<file_name>），bundle 未打包的 wheel
-      // （scipy 等）404——pip/安装兜底据此把 URL 重定向到官方 CDN
-      try {
-        const lockResp = await fetch("pyodide-local://bundle/pyodide-lock.json");
-        if (lockResp.ok) {
-          const lock = await lockResp.json();
-          const files = {};
-          for (const [name, info] of Object.entries(lock.packages || {})) {
-            files[name] = info.file_name || "";
-          }
-          window.__MS_LOCKFILE_FILES__ = files;
-        }
-      } catch (_) {}
       const modText = await modResp.text();
       // site-packages 路径经 sysconfig 取（Python 升级 3.14 不失效）
       const siteDir = pyodide.runPython(
