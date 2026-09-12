@@ -64,9 +64,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
 
     public override init() {
         super.init()
-        Task { @MainActor in
-            setupWebView()
-        }
+        // 类是 @MainActor，init 已在主 actor 上——同步初始化。
+        // 不能用 Task 调度：首次访问 shared 的调用方可能先于该 Task
+        // 执行 awaitReady → ensureWebAttached，webView 仍为 nil 直接崩溃。
+        setupWebView()
     }
 
     private func setupWebView() {
@@ -98,6 +99,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 窗口层级内，WebKit 才为 WebContent 进程持前台断言，JS 才能持续存活。
     private func ensureWebAttached() {
         #if os(iOS)
+        // setupWebView 可能尚未执行（历史调用序列防御），此时无从挂载
+        guard webView != nil else { return }
         // 已挂在仍处于前台场景的 window 上 → 无需处理
         if let current = webView.window,
            current.windowScene?.activationState == .foregroundActive { return }
