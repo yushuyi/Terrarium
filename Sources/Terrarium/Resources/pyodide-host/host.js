@@ -193,19 +193,24 @@ async function runPython(id, code) {
     // 远不会被自动加载，冷启动首跑必 ModuleNotFoundError。此处补一环：
     // 识别用户 import 的 persist 包，读其 dist-info/METADATA 的
     // Requires-Dist，与 lockfile 求交后 loadPackage（幂等、离线、全 bundle）
+    const dbg = (m) => { if (currentRunId) post({ kind: "stderr", id: currentRunId, line: "[persistdeps] " + m }); };
     try {
+      dbg("阶段1: 开始");
       const persistDeps = new Set();
       const fsEntries = pyodide.FS.readdir("/persist/site-packages").filter(
         (e) => e.endsWith(".dist-info")
       );
+      dbg("阶段2: dist-info=" + JSON.stringify(fsEntries));
       const imported = new Set();
       for (const m of code.matchAll(/^\s*(?:import|from)\s+([A-Za-z_][\w.]*)/gm)) {
         imported.add(m[1].split(".")[0].toLowerCase());
       }
+      dbg("阶段3: imported=" + JSON.stringify([...imported]));
       for (const name of imported) {
         const di = fsEntries.find(
           (e) => e.toLowerCase().startsWith(name + "-") || e.toLowerCase().replace(/_/g, "-").startsWith(name.replace(/_/g, "-") + "-")
         );
+        dbg("阶段4: name=" + name + " di=" + (di || "无"));
         if (!di) continue;
         try {
           const meta = pyodide.FS.readFile(
@@ -219,16 +224,35 @@ async function runPython(id, code) {
           }
         } catch (_) {}
       }
-      const lockPkgs = pyodide.lockfile && pyodide.lockfile.packages ? pyodide.lockfile.packages : {};
-      const toLoad = [...persistDeps].filter(
-        (d) => lockPkgs[d] && !pyodide.loadedPackages[d]
-      );
-      if (toLoad.length) {
-        await pyodide.loadPackage(toLoad, {
-          messageCallback: (m) => {
-            if (currentRunId) post({ kind: "stderr", id: currentRunId, line: String(m) });
-          },
-        });
+      // 逐个 try-catch：bundle 里有的（pandas/numpy/lxml/bs4/requests 等）
+      // loadPackage 成功走离线 wheel；bundle 没有的（websocket-client 等）
+      // loadPackage 报错被跳过，由 persist 副本或用户侧 pip 兜底。
+      // 不用 pyodide.lockfile 对象做白名单：JS 侧该属性不可靠（实测为
+      // undefined），交集恒空会让解析整环失效。
+      // DEP_ALIASES：PyPI 占位/简写名 → Pyodide lockfile 包名。真机实测
+      // tushare 声明 Requires-Dist: bs4，而发行版包名是 beautifulsoup4，
+      // 直接 loadPackage("bs4") 找不到包被静默跳过导致 import bs4 失败。
+      const DEP_ALIASES = {
+        "bs4": "beautifulsoup4",
+        "yaml": "pyyaml",
+        "dateutil": "python-dateutil",
+        "cv2": "opencv-python",
+        "sklearn": "scikit-learn",
+        "crypto": "pycryptodome",
+        "attr": "attrs",
+      };
+      dbg("阶段5: deps=" + JSON.stringify([...persistDeps]));
+      for (const dep of persistDeps) {
+        const canonical = DEP_ALIASES[dep] || dep;
+        if (pyodide.loadedPackages[canonical] || pyodide.loadedPackages[dep]) continue;
+        dbg("阶段6: loadPackage " + canonical);
+        try {
+          await pyodide.loadPackage(canonical, {
+            messageCallback: (m) => {
+              if (currentRunId) post({ kind: "stderr", id: currentRunId, line: String(m) });
+            },
+          });
+        } catch (_) {}
       }
     } catch (persistErr) {
       if (currentRunId)
