@@ -472,20 +472,24 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// run 后调用：把 host.js 收集的 MEMFS 变更写回宿主 Documents。
     /// 载荷为 b64(JSON{w: {相对路径: b64内容}, d: [待删相对路径]})。
     /// 写回后重算指纹——宿主与 MEMFS 已一致，下次 run 可跳过注入。
-    private func applyWorkspaceWrites(base64Payload: String) {
+    /// - Parameter done: 写回与指纹重算全部完成后回调（保证紧随的原生
+    ///   读看到最新宿主状态）；载荷无效时同步回调
+    private func applyWorkspaceWrites(base64Payload: String, done: @escaping () -> Void) {
         guard let data = Data(base64Encoded: base64Payload),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let writes = obj["w"] as? [String: String],
               let deletes = obj["d"] as? [String] else {
             os_log("[Pyodide] 工作区收集载荷无效，忽略", log: Log.pyodide)
+            done()
             return
         }
         let docsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].standardizedFileURL.path
-        // 写回 IO 放后台（review M6）：runResult 已 resume，不阻塞主线程
+        // 写回 IO 放后台（review M6）不占主线程；但 run 结果在写回完成后
+        // 才对工具层可见——竞态窗口已在源头消除
         Task.detached(priority: .userInitiated) { [weak self] in
             let result = Self.applyWritesIO(writes: writes, deletes: deletes, docsPath: docsPath)
             await MainActor.run { [weak self] in
-                guard let self else { return }
+                guard let self else { done(); return }
                 // 宿主已与 MEMFS 对齐：以写回后的宿主状态重算指纹。
                 // 任一写/删失败（review m4）则不置注入标志，下轮重注入自愈
                 self.wsLastFingerprint = self.documentsFingerprint()
@@ -493,6 +497,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 if result.applied > 0 {
                     os_log("[Pyodide] 工作区收集写回 %{public}ld 个文件", log: Log.pyodide, Int32(result.applied))
                 }
+                done()
             }
         }
     }
@@ -686,17 +691,22 @@ public final class PyodideBridge: NSObject, ObservableObject {
             if let b64 = body["persistB64"] as? String {
                 storePersistMirror(base64: b64)
             }
-            // I-4：run 后工作区 diff 收集，写回宿主 Documents
-            if let wsB64 = body["wsWriteB64"] as? String, !wsB64.isEmpty {
-                applyWorkspaceWrites(base64Payload: wsB64)
-            }
-            cont.resume(returning: PyodideRunResult(
+            // I-4：run 后工作区 diff 收集，写回宿主 Documents。
+            // 写回完成（含指纹重算）后才 resume——紧随的原生读必须看到
+            // 写回结果；否则批次/脚本里"pyodide 写完立刻 shell 读"会踩
+            // 写回后台任务的竞态窗口
+            let runOutput = PyodideRunResult(
                 stdout: (body["stdout"] as? String) ?? "",
                 stderr: (body["stderr"] as? String) ?? "",
                 exception: body["exception"] as? String,
                 exitCode: (body["exitCode"] as? Int) ?? 0,
                 durationMs: (body["durationMs"] as? Int) ?? 0
-            ))
+            )
+            if let wsB64 = body["wsWriteB64"] as? String, !wsB64.isEmpty {
+                applyWorkspaceWrites(base64Payload: wsB64) { cont.resume(returning: runOutput) }
+                return
+            }
+            cont.resume(returning: runOutput)
         case "stdout", "stderr":
             // 流式输出：行到达即回调；无回调方时仅由 JS 侧缓冲进 runResult
             guard let id = body["id"] as? String,

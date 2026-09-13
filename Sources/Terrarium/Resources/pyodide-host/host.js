@@ -194,6 +194,28 @@ if "${sitePackages}" not in sys.path:
       const docRoot = window.__MS_DOCROOT__ || "";
       if (docRoot) {
         const docRootLit = JSON.stringify(docRoot);
+        // /tmp → Documents/tmp 映射（I-8）：与原生 CPython 的 TMPDIR 语义
+        // 对齐——第一期 T13（python 写 /tmp 落 Documents/tmp）走原生路由
+        // 通过，Pyodide 路由下 /tmp 是调用内独立临时区，与 shell/read_file
+        // 交换数据的用法静默失效。symlink 让 pyodide 的 /tmp 写直接落宿主
+        try {
+          pyodide.FS.mkdirTree(docRoot + "/Documents/tmp");
+          try {
+            // 已是正确链接则跳过；MEMFS 自带 /tmp 是普通目录（readlink 抛错）
+            const linked = pyodide.FS.readlink("/tmp");
+            if (linked !== docRoot + "/Documents/tmp") {
+              bootWarnings.push("pyodide /tmp 已存在且非预期链接: " + linked);
+            }
+          } catch (linkErr) {
+            try { pyodide.FS.rmdir("/tmp"); } catch (rmErr) {}
+            try { pyodide.FS.symlink(docRoot + "/Documents/tmp", "/tmp"); }
+            catch (symErr) {
+              bootWarnings.push("pyodide /tmp 映射失败: " + String(symErr));
+            }
+          }
+        } catch (tmpErr) {
+          bootWarnings.push("pyodide /tmp 目录创建失败: " + String(tmpErr));
+        }
         await pyodide.runPythonAsync(
           "import os, builtins as _msb, sys as _mssys\n" +
           "os.environ['HOME'] = " + JSON.stringify(docRoot) + "\n" +
@@ -415,6 +437,8 @@ async function runPython(id, code) {
         const wsGlobals = pyodide.toPy({});
         try { await pyodide.runPythonAsync(WS_RESTORE_SRC, { globals: wsGlobals }); }
         finally { wsGlobals.destroy(); }
+        // 对账会删 MEMFS 空目录，/tmp symlink 的目标必须在此后重建
+        try { pyodide.FS.mkdirTree(window.__MS_DOCROOT__ + "/Documents/tmp"); } catch (e) {}
         window.__MS_WS_READY__ = true;
       } catch (e) { console.warn("[pyodide] 工作区恢复失败:", e); }
     }
