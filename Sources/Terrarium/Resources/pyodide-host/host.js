@@ -19,6 +19,9 @@ let currentRunId = null;
 // 启动期警告（ssl/代理注入失败等）——首跑时经 stderr 流出，避免静默
 let bootWarnings = [];
 let persistB64 = null; // pip 流程输出的持久化镜像（随 runResult 回传）
+// 工作区快照桥（I-4）：run 后收集的 MEMFS Documents 变更（b64 JSON），
+// 随 runResult 回传 Swift 写回宿主
+let wsWriteB64 = null;
 
 // Persistent storage path inside Pyodide's emscripten FS. Installed packages
 // land here in-session; across launches they come back via the native mirror
@@ -45,6 +48,11 @@ async function bootstrap() {
           persistB64 = text.slice("__TERRARIUM_PERSIST_B64__:".length).trim();
           return;
         }
+        // 工作区收集 marker：捕获后随 runResult 回传，不进终端流
+        if (text.startsWith("__MS_WS_WRITE_B64__:")) {
+          wsWriteB64 = text.slice("__MS_WS_WRITE_B64__:".length).trim();
+          return;
+        }
         stdoutBuf += text + "\n";
         // 流式转发给 Swift（__TERRARIUM_IMG__ 标记行留给 runResult，
         // 图像渲染走专门通道，不刷终端）
@@ -65,6 +73,10 @@ async function bootstrap() {
     // 跨启动经「原生镜像」恢复——WebKit 对自定义 scheme 页面的 IndexedDB
     // 是临时的（IDBFS 方案实测同容器冷启动即丢，且无任何报错），不可依赖。
     pyodide.FS.mkdir(PERSIST_DIR);
+    // 工作区快照桥就绪标志（I-4）：Swift 注入快照且 host.js restore
+    // 成功后置 true——guard 据此决定是否打"内存态"警告。js 模块对
+    // window 缺失属性抛 AttributeError，必须先初始化
+    window.__MS_WS_READY__ = false;
 
     // 等待 Swift 注入持久化镜像（window.__MS_PERSIST_B64__，见
     // PyodideBridge.seedPersistMirror）。旧宿主/无镜像时 15s 超时放行。
@@ -192,7 +204,8 @@ if "${sitePackages}" not in sys.path:
           "    except Exception:\n" +
           "        _p = ''\n" +
           "    _mode = a[0] if a else 'r'\n" +
-          "    if isinstance(_p, str) and isinstance(_mode, str) and _p.startswith(" + docRootLit + ") and any(c in _mode for c in 'wax+'):\n" +
+          "    _ws_ready = bool(getattr(__import__('js').window, '__MS_WS_READY__', False))\n" +
+          "    if isinstance(_p, str) and isinstance(_mode, str) and _p.startswith(" + docRootLit + ") and any(c in _mode for c in 'wax+') and not _ws_ready:\n" +
           "        print('⚠️ pyodide 运行时的文件写入为内存态（App 重启即丢）；需要持久化请改用 write_file 工具或原生 python3 路径', file=_mssys.stderr)\n" +
           "    return _ms_orig_open(file, *a, **k)\n" +
           "_msb.open = _ms_guarded_open"
@@ -327,7 +340,57 @@ async function runPython(id, code) {
     }
   };
 
+  // 工作区快照恢复（I-4）：Swift 在 run 前注入的 Documents 快照写到
+  // MEMFS 容器根绝对路径（HOME 已固化，open 即命中），manifest 落
+  // /persist 供 run 后 diff 收集。幂等：无 b64 时零开销跳过
+  const WS_RESTORE_SRC = [
+    "import json as _msj, os as _mso, base64 as _msb",
+    "_root = __import__('js').window.__MS_DOCROOT__ or ''",
+    "if _root:",
+    "    _ws = _msj.loads(__import__('js').window.__MS_WS_B64__ or '[]')",
+    "    for _e in _ws:",
+    "        _p = _mso.path.join(_root, _e['p'])",
+    "        _mso.makedirs(_mso.path.dirname(_p), exist_ok=True)",
+    "        open(_p, 'wb').write(_msb.b64decode(_e['d']))",
+    "    _msj.dump({e['p']: len(_msb.b64decode(e['d'])) for e in _ws},",
+    "              open('/persist/.ms_ws_manifest.json', 'w'))",
+    "__import__('js').window.__MS_WS_B64__ = None",
+  ].join("\n");
+  // 工作区收集（I-4）：对比注入 manifest 与当前 MEMFS 容器根子树，
+  // 新增/变更/删除打包回传；manifest 更新为当前状态供下次 diff。
+  // size+mtime 双字段对比，等长内容变更也能检出
+  const WS_COLLECT_SRC = [
+    "import os as _o, json as _j, base64 as _b",
+    "_root = __import__('js').window.__MS_DOCROOT__ or ''",
+    "if _root:",
+    "    try: _mf = _j.load(open('/persist/.ms_ws_manifest.json'))",
+    "    except Exception: _mf = {}",
+    "    _cur, _w = {}, {}",
+    "    for _dp, _dn, _fn in _o.walk(_root):",
+    "        for _f in _fn:",
+    "            _p = _o.path.join(_dp, _f)",
+    "            _r = _p[len(_root):].lstrip('/')",
+    "            try: _st = _o.stat(_p)",
+    "            except Exception: continue",
+    "            _sig = [_st.st_size, int(_st.st_mtime)]",
+    "            _cur[_r] = _sig",
+    "            if _r not in _mf or _mf[_r] != _sig:",
+    "                try: _w[_r] = _b.b64encode(open(_p, 'rb').read()).decode()",
+    "                except Exception: pass",
+    "    _d = [_r for _r in _mf if _r not in _cur]",
+    "    if _w or _d:",
+    "        print('__MS_WS_WRITE_B64__:' + _b.b64encode(_j.dumps({'w': _w, 'd': _d}).encode()).decode())",
+    "    _j.dump(_cur, open('/persist/.ms_ws_manifest.json', 'w'))",
+  ].join("\n");
+
   const runUser = async () => {
+    // 工作区快照恢复须在一切用户可见执行之前
+    if (window.__MS_WS_B64__) {
+      try {
+        await pyodide.runPythonAsync(WS_RESTORE_SRC);
+        window.__MS_WS_READY__ = true;
+      } catch (e) { console.warn("[pyodide] 工作区恢复失败:", e); }
+    }
     await loadFromLockfile();
     // urllib3 在用户 import 时会被再次注入 emscripten 连接类，执行前还原
     try {
@@ -355,6 +418,9 @@ async function runPython(id, code) {
     exception = String(e && e.message || e);
     exitCode = 1;
   } finally {
+    // 工作区收集：用户 code 抛异常也可能写过文件，成功失败都要收集
+    try { await pyodide.runPythonAsync(WS_COLLECT_SRC); }
+    catch (e) { console.warn("[pyodide] 工作区收集失败:", e); }
     currentRunId = null;
   }
   const durationMs = Math.round(performance.now() - t0);
@@ -362,12 +428,14 @@ async function runPython(id, code) {
     kind: "runResult",
     id,
     stdout: stdoutBuf,
-    stderr: stderrBuf,
+    stderr: "",
     exception,
     exitCode,
     durationMs,
     persistB64,
+    wsWriteB64,
   });
+  wsWriteB64 = null;
 }
 
 /// savefig 文件名保留（测试计划 I-2）：patch Figure.savefig，用户

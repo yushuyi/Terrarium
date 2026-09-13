@@ -300,6 +300,195 @@ public final class PyodideBridge: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - 工作区快照桥（测试计划 I-4 根治）
+    //
+    // pyodide FS 是纯 MEMFS，Documents 对它不可见——import C 扩展包的
+    // 脚本被路由到 pyodide 后，文件读写与原生侧完全脱节（第二期 I-4）。
+    // 桥接机制：run 前 Swift 把 Documents 打包注入 MEMFS 容器根路径
+    // （HOME 已固化，open 绝对路径即命中），run 后 host.js 收集 diff
+    // 回传，Swift 写回宿主——两侧文件视图保持一致。
+
+    /// 快照护栏：Documents 超过该字节数/文件数则放弃注入（MEMFS 退化为
+    /// 隔离态，guard 的内存态警告保持启用，行为与修复前一致）
+    private static let wsMaxTotalBytes = 32 * 1024 * 1024
+    private static let wsMaxFileCount = 2000
+    /// 单文件上限：大二进制（数据库/媒体）不进快照，避免注入与收集
+    /// 载荷把同步 XHR/postMessage 通道拖垮（首版全量打包曾卡死 App）
+    private static let wsMaxFileBytes = 8 * 1024 * 1024
+    /// 快照排除：App 私有数据目录与运行时通道文件。persist zip 走专用
+    /// 镜像通道；tmp/ 是 run_script 临时脚本（pyodide 经 code 参数拿
+    /// 内容）；其余是聊天/记忆/收件箱等 App 自管数据，不参与 pyodide
+    /// 工作区。快照只覆盖用户工作产物（tests/、pyodide_figures/、
+    /// 脚本与数据文件等）
+    private static let wsExcludedPrefixes: Set<String> = [
+        "Conversations/", "Memory/", "Inbox/", "CLIShims/", "tmp/", "backups/",
+    ]
+    private static let wsExcludedFiles: Set<String> = [
+        "pyodide_persist.zip", "MCPServers.json",
+    ]
+
+    /// 上次注入的 Documents 指纹（相对路径|大小|mtime 稳定排序拼接）。
+    /// 收集写回后更新——宿主与 MEMFS 一致期间跳过重复注入。
+    private var wsLastFingerprint: String?
+    /// 当前页面已注入标志（页面重载后 JS 变量清空，须与指纹双重判断）
+    private var wsInjectedIntoCurrentPage = false
+    /// 每次注入的诊断（runId → 诊断串），随该次 runResult 的 stderr 回传
+    private var wsDiagByRunId: [String: String] = [:]
+
+    /// 显式前缀剥离取相对 Documents 路径。此前 dropFirst(count+1) 隐式
+    /// 计算在真机上多剥 2 字符（'Documents'→'cuments'），排除前缀失效、
+    /// restore 错位写入——改为 hasPrefix 匹配，不匹配返回 nil 由调用方跳过
+    private func wsRelativePath(_ url: URL, docs: URL) -> String? {
+        // standardizedFileURL 统一双方：真机 enumerator 会给出
+        // /private/var/... 形态而 documentDirectory 是 /var/...，
+        // 不归一化则前缀永不匹配 → 指纹恒空串 → 恒"一致"跳过注入
+        let prefix = docs.standardizedFileURL.path + "/"
+        let path = url.standardizedFileURL.path
+        guard path.hasPrefix(prefix) else { return nil }
+        return String(path.dropFirst(prefix.count))
+    }
+
+    /// 快照范围判定：排除 App 私有数据/大文件，只保留用户工作产物
+    private func wsIncluded(_ rel: String, fileSize: Int) -> Bool {
+        if Self.wsExcludedFiles.contains(rel) || Self.wsExcludedPrefixes.contains(where: { rel.hasPrefix($0) }) {
+            return false
+        }
+        return fileSize <= Self.wsMaxFileBytes
+    }
+
+    /// Documents 递归指纹。返回 nil 表示超护栏或枚举失败（不启用快照桥）。
+    private func documentsFingerprint() -> String? {
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        guard let enumerator = fm.enumerator(
+            at: docs,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+        ) else { return nil }
+        var parts: [String] = []
+        var totalSize = 0
+        var count = 0
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
+                  values.isRegularFile == true else { continue }
+            guard let rel = wsRelativePath(url, docs: docs) else { continue }
+            let size = values.fileSize ?? 0
+            guard wsIncluded(rel, fileSize: size) else { continue }
+            let mtime = Int((values.contentModificationDate ?? Date()).timeIntervalSince1970)
+            parts.append("\(rel)|\(size)|\(mtime)")
+            count += 1
+            totalSize += size
+            if totalSize > Self.wsMaxTotalBytes || count > Self.wsMaxFileCount { return nil }
+        }
+        parts.sort()
+        return parts.joined(separator: "\u{1F}")
+    }
+
+    /// run 前调用：宿主 Documents 快照注入 MEMFS。
+    /// 注入的是 [{p: 相对Documents路径, d: base64}] JSON（分块，单次
+    /// evaluate 传 MB 级字符串易触发 WebKit 上限）；解包由 host.js 的
+    /// runUser 开头执行（b64 就位时先 restore 再跑用户代码）。指纹与
+    /// 页面标志双重判断，宿主未变且 MEMFS 仍持有快照时零开销跳过。
+    func seedWorkspaceMirror() async -> String {
+        // 必须让 JS 返回 String：boolean 会被 evaluate 的 as? String 丢弃
+        let readyOnPage = await evaluate("String(window.__MS_WS_READY__ === true)")
+        if readyOnPage != "true" {
+            wsInjectedIntoCurrentPage = false
+            wsLastFingerprint = nil
+        }
+        if wsInjectedIntoCurrentPage,
+           let fp = wsLastFingerprint,
+           fp == documentsFingerprint() {
+            return "" // MEMFS 与宿主一致，零开销跳过
+        }
+        guard let fingerprint = documentsFingerprint() else {
+            os_log("[Pyodide] 工作区快照跳过：Documents 超护栏（>32MB 或 >2000 文件）",
+                   log: Log.pyodide)
+            return ""
+        }
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        guard let enumerator = fm.enumerator(at: docs, includingPropertiesForKeys: [.isRegularFileKey]) else {
+            return ""
+        }
+        var entries: [[String: String]] = []
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
+                  values.isRegularFile == true else { continue }
+            guard let rel = wsRelativePath(url, docs: docs) else { continue }
+            guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+                  wsIncluded(rel, fileSize: values.fileSize ?? 0),
+                  let data = try? Data(contentsOf: url) else { continue }
+            // p 统一为相对容器根（Documents/ 前缀），与 host.js 的
+            // restore 落位（join(DOCROOT, p)）及收集/写回的 key 语义一致
+            entries.append(["p": "Documents/" + rel, "d": data.base64EncodedString()])
+        }
+        guard let payloadData = try? JSONSerialization.data(withJSONObject: entries),
+              let payload = String(data: payloadData, encoding: .utf8) else {
+            return ""
+        }
+        var injected = 0
+        var idx = payload.startIndex
+        while idx < payload.endIndex {
+            let end = payload.index(idx, offsetBy: 1_000_000, limitedBy: payload.endIndex) ?? payload.endIndex
+            let chunk = String(payload[idx..<end])
+            let op = injected == 0 ? "=" : "+="
+            _ = await evaluate("window.__MS_WS_B64__ \(op) '\(chunk)'; 'ok'")
+            injected += 1
+            idx = end
+        }
+        wsLastFingerprint = fingerprint
+        wsInjectedIntoCurrentPage = true
+        os_log("[Pyodide] 工作区快照注入完成 文件数=%{public}ld payload=%{public}ld 字节",
+               log: Log.pyodide, Int32(entries.count), Int32(payload.utf8.count))
+        return ""
+    }
+
+    /// run 后调用：把 host.js 收集的 MEMFS 变更写回宿主 Documents。
+    /// 载荷为 b64(JSON{w: {相对路径: b64内容}, d: [待删相对路径]})。
+    /// 写回后重算指纹——宿主与 MEMFS 已一致，下次 run 可跳过注入。
+    private func applyWorkspaceWrites(base64Payload: String) {
+        guard let data = Data(base64Encoded: base64Payload),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let writes = obj["w"] as? [String: String],
+              let deletes = obj["d"] as? [String] else {
+            os_log("[Pyodide] 工作区收集载荷无效，忽略", log: Log.pyodide)
+            return
+        }
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        // 路径安全：拒绝绝对路径与路径穿越成分（载荷来自本运行时收集
+        // 脚本，正常只含 Documents/ 前缀；校验防标记行伪造越界写）
+        func validatedRel(_ rel: String) -> String? {
+            guard !rel.hasPrefix("/"), rel.hasPrefix("Documents/") else { return nil }
+            let comps = rel.split(separator: "/").map(String.init)
+            guard !comps.contains("..") else { return nil }
+            return rel
+        }
+        var applied = 0
+        for (rel, b64) in writes {
+            guard let safeRel = validatedRel(rel), let content = Data(base64Encoded: b64) else { continue }
+            let target = docs.appendingPathComponent(String(safeRel.dropFirst("Documents/".count)))
+            try? fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            do {
+                try content.write(to: target, options: .atomic)
+                applied += 1
+            } catch {
+                os_log("[Pyodide] 工作区写回失败 %{public}@: %{public}@", log: Log.pyodide, rel, String(describing: error))
+            }
+        }
+        for rel in deletes {
+            guard let safeRel = validatedRel(rel) else { continue }
+            let target = docs.appendingPathComponent(String(safeRel.dropFirst("Documents/".count)))
+            try? fm.removeItem(at: target)
+        }
+        // 宿主已与 MEMFS 对齐：以写回后的宿主状态重算指纹
+        wsLastFingerprint = documentsFingerprint()
+        wsInjectedIntoCurrentPage = true
+        if applied > 0 {
+            os_log("[Pyodide] 工作区收集写回 %{public}ld 个文件", log: Log.pyodide, Int32(applied))
+        }
+    }
+
     // MARK: Run code
 
     public func runPython(code: String) async -> PyodideRunResult {
@@ -322,6 +511,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
                                     exception: nil, exitCode: -1, durationMs: 0)
         }
         let id = UUID().uuidString
+        wsDiagByRunId[id] = await seedWorkspaceMirror() // I-4：快照注入诊断（随 stderr 回传）
         if let onOutput { outputHandlers[id] = onOutput }
         ensureWebAttached() // window 就绪晚于 bridge 初始化的场景兜底
         return await withCheckedContinuation { (cont: CheckedContinuation<PyodideRunResult, Never>) in
@@ -339,6 +529,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             guard let self, let cont = self.pendingRun.removeValue(forKey: id) else { return }
             self.outputHandlers.removeValue(forKey: id)
+            self.wsDiagByRunId.removeValue(forKey: id)
             self.isReady = false
             self.loadHostPage()
             cont.resume(returning: PyodideRunResult(
@@ -437,9 +628,14 @@ public final class PyodideBridge: NSObject, ObservableObject {
             if let b64 = body["persistB64"] as? String {
                 storePersistMirror(base64: b64)
             }
+            // I-4：run 后工作区 diff 收集，写回宿主 Documents
+            var wsDiag = wsDiagByRunId.removeValue(forKey: id) ?? ""
+            if let wsB64 = body["wsWriteB64"] as? String, !wsB64.isEmpty {
+                applyWorkspaceWrites(base64Payload: wsB64)
+            }
             cont.resume(returning: PyodideRunResult(
                 stdout: (body["stdout"] as? String) ?? "",
-                stderr: (body["stderr"] as? String) ?? "",
+                stderr: (wsDiag + ((body["stderr"] as? String) ?? "")),
                 exception: body["exception"] as? String,
                 exitCode: (body["exitCode"] as? Int) ?? 0,
                 durationMs: (body["durationMs"] as? Int) ?? 0
