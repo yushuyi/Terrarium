@@ -385,6 +385,10 @@ async function ensureSavefigPatched() {
       "_ms_saved_figs = set()\n" +
       "def _ms_named_savefig(self, *a, **k):\n" +
       "    _f = a[0] if a else k.get('fname')\n" +
+      "    if _f is None:\n" +
+      "        import time as _ms_t\n" +
+      "        _f = 'figure_%d.png' % int(_ms_t.time() * 1000)\n" +
+      "        a = (_f,) + a\n" +
       "    if isinstance(_f, (str, _ms_os.PathLike)):\n" +
       "        try:\n" +
       "            import io as _io, base64 as _b64\n" +
