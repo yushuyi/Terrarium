@@ -48,7 +48,8 @@ async function bootstrap() {
         stdoutBuf += text + "\n";
         // 流式转发给 Swift（__TERRARIUM_IMG__ 标记行留给 runResult，
         // 图像渲染走专门通道，不刷终端）
-        if (currentRunId && !text.startsWith("__TERRARIUM_IMG_PNG_B64__:")) {
+        if (currentRunId && !text.startsWith("__TERRARIUM_IMG_PNG_B64__:") &&
+            !text.startsWith("__MS_SAVEFIG_PNG_B64__:")) {
           post({ kind: "stdout", id: currentRunId, line: text });
         }
       },
@@ -333,6 +334,9 @@ async function runPython(id, code) {
       await pyodide.runPythonAsync("import mianshu_http; mianshu_http.ensure()");
     } catch (_) {}
     await ensureSavefigPatched();
+    // 已保存 figure 集合按次清空：close('all') 后 number 从 1 复用，
+    // 残留会让新 run 的同号图被 auto-show 误跳过
+    try { await pyodide.runPythonAsync("globals().get('_ms_saved_figs', set()).clear()"); } catch (_) {}
     await pyodide.runPythonAsync(code);
     // Jupyter-style auto-show: if the user's code created matplotlib
     // figures but never called `.show()` or saved them, auto-render
@@ -375,9 +379,13 @@ async function ensureSavefigPatched() {
   if (window.__MS_SAVEFIG_PATCHED__) return;
   try {
     await pyodide.runPythonAsync(
+      "import os as _ms_os\n" +
       "import matplotlib.figure as _ms_mfig\n" +
       "_ms_orig_savefig = _ms_mfig.Figure.savefig\n" +
+      "_ms_saved_figs = set()\n" +
       "def _ms_named_savefig(self, fname, *a, **k):\n" +
+      "    if not isinstance(fname, (str, _ms_os.PathLike)):\n" +
+      "        return _ms_orig_savefig(self, fname, *a, **k)\n" +
       "    try:\n" +
       "        import io as _io, base64 as _b64\n" +
       "        from matplotlib.backends.backend_agg import FigureCanvasAgg as _msAgg\n" +
@@ -387,6 +395,7 @@ async function ensureSavefigPatched() {
       "        _b.seek(0)\n" +
       "        _name = str(fname).replace('\\\\', '/').split('/')[-1]\n" +
       "        print('__MS_SAVEFIG_PNG_B64__:' + _name + ':' + _b64.b64encode(_b.read()).decode('ascii'))\n" +
+      "        _ms_saved_figs.add(self.number)\n" +
       "    except Exception:\n" +
       "        pass\n" +
       "    return _ms_orig_savefig(self, fname, *a, **k)\n" +
@@ -421,7 +430,10 @@ if 'matplotlib' in _sys.modules or 'matplotlib.pyplot' in _sys.modules:
         from matplotlib.backends.backend_agg import FigureCanvasAgg as _AggCanvas
         import io as _io, base64 as _b64
         _nums = list(_plt.get_fignums())
+        _saved = globals().get('_ms_saved_figs', set())
         for _num in _nums:
+            if _num in _saved:
+                continue
             try:
                 _fig = _plt.figure(_num)
                 _canvas = _AggCanvas(_fig)
