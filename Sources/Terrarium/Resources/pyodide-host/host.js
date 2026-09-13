@@ -332,6 +332,7 @@ async function runPython(id, code) {
     try {
       await pyodide.runPythonAsync("import mianshu_http; mianshu_http.ensure()");
     } catch (_) {}
+    await ensureSavefigPatched();
     await pyodide.runPythonAsync(code);
     // Jupyter-style auto-show: if the user's code created matplotlib
     // figures but never called `.show()` or saved them, auto-render
@@ -363,6 +364,38 @@ async function runPython(id, code) {
     durationMs,
     persistB64,
   });
+}
+
+/// savefig 文件名保留（测试计划 I-2）：patch Figure.savefig，用户
+/// savefig("qa.png") 的图经 Agg 渲染后以 __MS_SAVEFIG_PNG_B64__:<name>:
+/// <b64> 打回 Swift，按用户文件名落盘（MEMFS 写入语义不变）。必须在
+/// loadFromLockfile 之后调用——matplotlib 需先经用户代码的 import 加载，
+/// bootstrap 时 import 会直接 ModuleNotFoundError；幂等（标志位防重）。
+async function ensureSavefigPatched() {
+  if (window.__MS_SAVEFIG_PATCHED__) return;
+  try {
+    await pyodide.runPythonAsync(
+      "import matplotlib.figure as _ms_mfig\n" +
+      "_ms_orig_savefig = _ms_mfig.Figure.savefig\n" +
+      "def _ms_named_savefig(self, fname, *a, **k):\n" +
+      "    try:\n" +
+      "        import io as _io, base64 as _b64\n" +
+      "        from matplotlib.backends.backend_agg import FigureCanvasAgg as _msAgg\n" +
+      "        _c = _msAgg(self)\n" +
+      "        _b = _io.BytesIO()\n" +
+      "        _c.print_png(_b)\n" +
+      "        _b.seek(0)\n" +
+      "        _name = str(fname).replace('\\\\', '/').split('/')[-1]\n" +
+      "        print('__MS_SAVEFIG_PNG_B64__:' + _name + ':' + _b64.b64encode(_b.read()).decode('ascii'))\n" +
+      "    except Exception:\n" +
+      "        pass\n" +
+      "    return _ms_orig_savefig(self, fname, *a, **k)\n" +
+      "_ms_mfig.Figure.savefig = _ms_named_savefig"
+    );
+    window.__MS_SAVEFIG_PATCHED__ = true;
+  } catch (e) {
+    // matplotlib 未加载（用户没 import）时静默——没有 savefig 场景
+  }
 }
 
 /// Render every open matplotlib figure to a PNG and print it with the
