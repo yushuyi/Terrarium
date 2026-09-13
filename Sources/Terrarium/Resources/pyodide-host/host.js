@@ -383,22 +383,22 @@ async function ensureSavefigPatched() {
       "import matplotlib.figure as _ms_mfig\n" +
       "_ms_orig_savefig = _ms_mfig.Figure.savefig\n" +
       "_ms_saved_figs = set()\n" +
-      "def _ms_named_savefig(self, fname, *a, **k):\n" +
-      "    if not isinstance(fname, (str, _ms_os.PathLike)):\n" +
-      "        return _ms_orig_savefig(self, fname, *a, **k)\n" +
-      "    try:\n" +
-      "        import io as _io, base64 as _b64\n" +
-      "        from matplotlib.backends.backend_agg import FigureCanvasAgg as _msAgg\n" +
-      "        _c = _msAgg(self)\n" +
-      "        _b = _io.BytesIO()\n" +
-      "        _c.print_png(_b)\n" +
-      "        _b.seek(0)\n" +
-      "        _name = str(fname).replace('\\\\', '/').split('/')[-1]\n" +
-      "        print('__MS_SAVEFIG_PNG_B64__:' + _name + ':' + _b64.b64encode(_b.read()).decode('ascii'))\n" +
-      "        _ms_saved_figs.add(self.number)\n" +
-      "    except Exception:\n" +
-      "        pass\n" +
-      "    return _ms_orig_savefig(self, fname, *a, **k)\n" +
+      "def _ms_named_savefig(self, *a, **k):\n" +
+      "    _f = a[0] if a else k.get('fname')\n" +
+      "    if isinstance(_f, (str, _ms_os.PathLike)):\n" +
+      "        try:\n" +
+      "            import io as _io, base64 as _b64\n" +
+      "            from matplotlib.backends.backend_agg import FigureCanvasAgg as _msAgg\n" +
+      "            _c = _msAgg(self)\n" +
+      "            _b = _io.BytesIO()\n" +
+      "            _c.print_png(_b)\n" +
+      "            _b.seek(0)\n" +
+      "            _name = str(_f).replace('\\\\', '/').split('/')[-1]\n" +
+      "            print('__MS_SAVEFIG_PNG_B64__:' + _name + ':' + _b64.b64encode(_b.read()).decode('ascii'))\n" +
+      "            _ms_saved_figs.add(self.number)\n" +
+      "        except Exception:\n" +
+      "            pass\n" +
+      "    return _ms_orig_savefig(self, *a, **k)\n" +
       "_ms_mfig.Figure.savefig = _ms_named_savefig"
     );
     window.__MS_SAVEFIG_PATCHED__ = true;
