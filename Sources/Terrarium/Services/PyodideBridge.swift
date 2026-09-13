@@ -223,6 +223,12 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 os_log("[Pyodide] 持久化镜像注入长度不符 期望=%{public}ld 实际=%{public}@（本次会话可能无包）",
                        log: Log.pyodide, b64.count, got.isEmpty ? "0" : got)
             }
+            // 容器根注入：host.js bootstrap 用它固化 pyodide 的 HOME
+            // （与原生 CPython 的 PythonBridge.m setenv 对齐），须在
+            // SEEDED 置位前就绪。容器 UUID 路径不含引号，直接拼接安全
+            _ = await self.evaluate(
+                "window.__MS_DOCROOT__ = '\(NSHomeDirectory())'; 'docroot'"
+            )
             _ = await self.evaluate("window.__MS_PERSIST_SEEDED__ = true; 'seeded'")
         }
     }

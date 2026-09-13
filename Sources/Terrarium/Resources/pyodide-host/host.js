@@ -171,6 +171,37 @@ if "${sitePackages}" not in sys.path:
       console.warn("[mianshu_http] 注入失败:", e);
     }
 
+    // 运行时环境统一：HOME 固化为容器根（与原生 CPython 的
+    // PythonBridge.m setenv 对齐）。pyodide 默认 HOME=/home/pyodide
+    // 是 MEMFS 虚拟路径，`~` 展开跨运行时漂移（测试计划 I-3）。
+    // 同时对指向容器根的写模式 open 打告警：pyodide FS 是纯 MEMFS
+    // （IDBFS 实测同容器冷启动即丢），文件写入报成功但宿主永远
+    // 不可见，必须让静默丢失变有声。
+    try {
+      const docRoot = window.__MS_DOCROOT__ || "";
+      if (docRoot) {
+        const docRootLit = JSON.stringify(docRoot);
+        await pyodide.runPythonAsync(
+          "import os, builtins as _msb, sys as _mssys\n" +
+          "os.environ['HOME'] = " + JSON.stringify(docRoot) + "\n" +
+          "_ms_orig_open = _msb.open\n" +
+          "def _ms_guarded_open(file, *a, **k):\n" +
+          "    try:\n" +
+          "        _p = file if isinstance(file, str) else getattr(file, '__fspath__', lambda: '')()\n" +
+          "    except Exception:\n" +
+          "        _p = ''\n" +
+          "    _mode = a[0] if a else 'r'\n" +
+          "    if isinstance(_p, str) and isinstance(_mode, str) and _p.startswith(" + docRootLit + ") and any(c in _mode for c in 'wax+'):\n" +
+          "        print('⚠️ pyodide 运行时的文件写入为内存态（App 重启即丢）；需要持久化请改用 write_file 工具或原生 python3 路径', file=_mssys.stderr)\n" +
+          "    return _ms_orig_open(file, *a, **k)\n" +
+          "_msb.open = _ms_guarded_open"
+        );
+      }
+    } catch (e) {
+      bootWarnings.push("HOME 固化/写入告警注入失败: " + String(e && e.message || e));
+      console.warn("[pyodide] 环境统一注入失败:", e);
+    }
+
     pyodideReady = true;
     post({ kind: "ready", version: pyodide.version });
   } catch (err) {
