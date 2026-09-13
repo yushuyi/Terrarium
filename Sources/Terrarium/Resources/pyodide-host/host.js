@@ -205,7 +205,8 @@ if "${sitePackages}" not in sys.path:
           "        _p = ''\n" +
           "    _mode = a[0] if a else 'r'\n" +
           "    _ws_ready = bool(getattr(__import__('js').window, '__MS_WS_READY__', False))\n" +
-          "    if isinstance(_p, str) and isinstance(_mode, str) and _p.startswith(" + docRootLit + ") and any(c in _mode for c in 'wax+') and not _ws_ready:\n" +
+          "    _in_docs = _p.startswith(" + docRootLit + " + '/Documents/')\n" +
+          "    if isinstance(_p, str) and isinstance(_mode, str) and _p.startswith(" + docRootLit + ") and any(c in _mode for c in 'wax+') and (not _in_docs or not _ws_ready):\n" +
           "        print('⚠️ pyodide 运行时的文件写入为内存态（App 重启即丢）；需要持久化请改用 write_file 工具或原生 python3 路径', file=_mssys.stderr)\n" +
           "    return _ms_orig_open(file, *a, **k)\n" +
           "_msb.open = _ms_guarded_open"
@@ -240,6 +241,11 @@ async function runPython(id, code) {
     return;
   }
   resetBuffers();
+  if (currentRunId !== null) {
+    // 重入保护：与收集 marker 的全局单值语义配套，拒绝并发执行
+    post({ kind: "runResult", id, stdout: "", stderr: "", exception: "另一个 Pyodide 执行仍在进行，已拒绝并发运行", exitCode: 1, durationMs: 0 });
+    return;
+  }
   currentRunId = id;
   if (bootWarnings.length) {
     for (const w of bootWarnings) {
@@ -348,12 +354,28 @@ async function runPython(id, code) {
     "_root = __import__('js').window.__MS_DOCROOT__ or ''",
     "if _root:",
     "    _ws = _msj.loads(__import__('js').window.__MS_WS_B64__ or '[]')",
+    "    _keep = set(e['p'] for e in _ws)",
+    "    _docs = _mso.path.join(_root, 'Documents')",
+    "    if _mso.path.isdir(_docs):",
+    "        for _dp, _dn, _fn in _mso.walk(_docs, topdown=False):",
+    "            for _f in _fn:",
+    "                _p = _mso.path.join(_dp, _f)",
+    "                if _p[len(_root):].lstrip('/') not in _keep:",
+    "                    try: _mso.remove(_p)",
+    "                    except OSError: pass",
+    "            for _d in _dn:",
+    "                try: _mso.rmdir(_mso.path.join(_dp, _d))",
+    "                except OSError: pass",
+    "    _mf = {}",
     "    for _e in _ws:",
     "        _p = _mso.path.join(_root, _e['p'])",
     "        _mso.makedirs(_mso.path.dirname(_p), exist_ok=True)",
     "        open(_p, 'wb').write(_msb.b64decode(_e['d']))",
-    "    _msj.dump({e['p']: len(_msb.b64decode(e['d'])) for e in _ws},",
-    "              open('/persist/.ms_ws_manifest.json', 'w'))",
+    "        try:",
+    "            _st = _mso.stat(_p)",
+    "            _mf[_e['p']] = [_st.st_size, int(_st.st_mtime)]",
+    "        except OSError: pass",
+    "    _msj.dump(_mf, open('/persist/.ms_ws_manifest.json', 'w'))",
     "__import__('js').window.__MS_WS_B64__ = None",
   ].join("\n");
   // 工作区收集（I-4）：对比注入 manifest 与当前 MEMFS 容器根子树，
@@ -370,6 +392,8 @@ async function runPython(id, code) {
     "        for _f in _fn:",
     "            _p = _o.path.join(_dp, _f)",
     "            _r = _p[len(_root):].lstrip('/')",
+    "            if not _r.startswith('Documents/'):",
+    "                continue",
     "            try: _st = _o.stat(_p)",
     "            except Exception: continue",
     "            _sig = [_st.st_size, int(_st.st_mtime)]",
@@ -378,16 +402,19 @@ async function runPython(id, code) {
     "                try: _w[_r] = _b.b64encode(open(_p, 'rb').read()).decode()",
     "                except Exception: pass",
     "    _d = [_r for _r in _mf if _r not in _cur]",
+    "    _j.dump(_cur, open('/persist/.ms_ws_manifest.json', 'w'))",
     "    if _w or _d:",
     "        print('__MS_WS_WRITE_B64__:' + _b.b64encode(_j.dumps({'w': _w, 'd': _d}).encode()).decode())",
-    "    _j.dump(_cur, open('/persist/.ms_ws_manifest.json', 'w'))",
   ].join("\n");
 
   const runUser = async () => {
     // 工作区快照恢复须在一切用户可见执行之前
     if (window.__MS_WS_B64__) {
       try {
-        await pyodide.runPythonAsync(WS_RESTORE_SRC);
+        // 独立 globals（review m6）：临时变量不落用户命名空间
+        const wsGlobals = pyodide.toPy({});
+        try { await pyodide.runPythonAsync(WS_RESTORE_SRC, { globals: wsGlobals }); }
+        finally { wsGlobals.destroy(); }
         window.__MS_WS_READY__ = true;
       } catch (e) { console.warn("[pyodide] 工作区恢复失败:", e); }
     }
@@ -419,8 +446,15 @@ async function runPython(id, code) {
     exitCode = 1;
   } finally {
     // 工作区收集：用户 code 抛异常也可能写过文件，成功失败都要收集
-    try { await pyodide.runPythonAsync(WS_COLLECT_SRC); }
-    catch (e) { console.warn("[pyodide] 工作区收集失败:", e); }
+    const wsGlobals = pyodide.toPy({});
+    try {
+      await pyodide.runPythonAsync(WS_COLLECT_SRC, { globals: wsGlobals });
+    } catch (e) {
+      console.warn("[pyodide] 工作区收集失败:", e);
+      window.__MS_WS_READY__ = false; // 收集失效即快照链路可疑，下轮强制重注入
+    } finally {
+      wsGlobals.destroy();
+    }
     currentRunId = null;
   }
   const durationMs = Math.round(performance.now() - t0);
@@ -529,7 +563,9 @@ if 'matplotlib' in _sys.modules or 'matplotlib.pyplot' in _sys.modules:
   } catch (jsErr) {
     // Last-resort JS-side catch. Surface to stderrBuf so the Swift side
     // sees something other than silence when this path explodes.
-    stderrBuf += "[terrarium] auto-show JS error: " + String(jsErr) + "\n";
+    if (currentRunId !== null) {
+      post({ kind: "stderr", id: currentRunId, line: "[terrarium] auto-show JS error: " + String(jsErr) });
+    }
   }
 }
 
