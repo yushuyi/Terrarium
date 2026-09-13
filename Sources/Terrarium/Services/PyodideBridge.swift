@@ -316,12 +316,15 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 载荷把同步 XHR/postMessage 通道拖垮（首版全量打包曾卡死 App）
     private nonisolated static let wsMaxFileBytes = 8 * 1024 * 1024
     /// 快照排除：App 私有数据目录与运行时通道文件。persist zip 走专用
-    /// 镜像通道；tmp/ 是 run_script 临时脚本（pyodide 经 code 参数拿
-    /// 内容）；其余是聊天/记忆/收件箱等 App 自管数据，不参与 pyodide
-    /// 工作区。快照只覆盖用户工作产物（tests/、pyodide_figures/、
-    /// 脚本与数据文件等）
+    /// 镜像通道；其余是聊天/记忆/收件箱等 App 自管数据，不参与 pyodide
+    /// 工作区。快照只覆盖用户工作产物（tests/、pyodide_figures/、tmp/
+    /// 与脚本数据文件等）。
+    /// tmp/ 曾被排除（当时的临时脚本语义），I-8 起 pyodide 的 /tmp
+    /// symlink 以 Documents/tmp 为宿主落点——写回、注入、指纹必须
+    /// 全链一致放行，否则 collect 对账会把写回的文件再删掉（震荡）；
+    /// run_script 临时脚本自带 defer 删除 + 残留清扫，不会在快照累积
     private nonisolated static let wsExcludedPrefixes: Set<String> = [
-        "Conversations/", "Memory/", "Inbox/", "CLIShims/", "tmp/", "backups/",
+        "Conversations/", "Memory/", "Inbox/", "CLIShims/", "backups/",
     ]
     private nonisolated static let wsExcludedFiles: Set<String> = [
         "pyodide_persist.zip", "MCPServers.json",
@@ -531,7 +534,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
         for (rel, b64) in writes {
             guard let tail = validatedRel(rel),
                   let target = validatedTarget(tail),
-                  let content = Data(base64Encoded: b64) else { continue }
+                  let content = Data(base64Encoded: b64) else {
+                os_log("[Pyodide] 工作区写回拒绝非法路径: %{public}@（越界/排除集/载荷无效）", log: Log.pyodide, rel)
+                continue
+            }
             try? fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
             do {
                 try content.write(to: target, options: .atomic)

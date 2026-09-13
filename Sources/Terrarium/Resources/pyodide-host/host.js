@@ -208,8 +208,11 @@ if "${sitePackages}" not in sys.path:
             }
           } catch (linkErr) {
             try { pyodide.FS.rmdir("/tmp"); } catch (rmErr) {}
-            try { pyodide.FS.symlink(docRoot + "/Documents/tmp", "/tmp"); }
-            catch (symErr) {
+            try {
+              pyodide.FS.symlink(docRoot + "/Documents/tmp", "/tmp");
+            } catch (symErr) {
+              // symlink 失败时兜底重建普通目录，避免 /tmp 比修复前更糟
+              try { pyodide.FS.mkdir("/tmp"); } catch (mkErr) {}
               bootWarnings.push("pyodide /tmp 映射失败: " + String(symErr));
             }
           }
@@ -439,7 +442,10 @@ async function runPython(id, code) {
         try { await pyodide.runPythonAsync(WS_RESTORE_SRC, { globals: wsGlobals }); }
         finally { wsGlobals.destroy(); }
         // 对账会删 MEMFS 空目录，/tmp symlink 的目标必须在此后重建
-        try { pyodide.FS.mkdirTree(window.__MS_DOCROOT__ + "/Documents/tmp"); } catch (e) {}
+        if (window.__MS_DOCROOT__) {
+          try { pyodide.FS.mkdirTree(window.__MS_DOCROOT__ + "/Documents/tmp"); }
+          catch (e) { console.warn("[pyodide] /tmp 目标目录重建失败:", e); }
+        }
         window.__MS_WS_READY__ = true;
       } catch (e) { console.warn("[pyodide] 工作区恢复失败:", e); }
     }
