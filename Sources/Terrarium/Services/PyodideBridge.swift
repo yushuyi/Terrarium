@@ -30,6 +30,11 @@ public enum Log {
     public static let pyodide = OSLog(subsystem: "com.yushuyi.MianshuAgentClient", category: "Pyodide")
 }
 
+// 整类主 actor：webView 创建/挂窗/evaluateJavaScript 全是主线程要求
+// 的 UIKit/WebKit 操作，此前仅靠调用方恰在主线程（全新安装首启的
+// 包管理页在后台 Task 调 awaitReady，ensureWebAttached 的 addSubview
+// 直接崩布局引擎断言）
+@MainActor
 public final class PyodideBridge: NSObject, ObservableObject {
 
     public static let shared = PyodideBridge()
