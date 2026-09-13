@@ -228,8 +228,9 @@ if "${sitePackages}" not in sys.path:
           "    _mode = a[0] if a else 'r'\n" +
           "    _ws_ready = bool(getattr(__import__('js').window, '__MS_WS_READY__', False))\n" +
           "    _in_docs = _p.startswith(" + docRootLit + " + '/Documents/')\n" +
-          "    if isinstance(_p, str) and isinstance(_mode, str) and _p.startswith(" + docRootLit + ") and any(c in _mode for c in 'wax+') and (not _in_docs or not _ws_ready):\n" +
-          "        print('⚠️ pyodide 运行时的文件写入为内存态（App 重启即丢）；需要持久化请改用 write_file 工具或原生 python3 路径', file=_mssys.stderr)\n" +
+          "    if isinstance(_p, str) and isinstance(_mode, str) and _p.startswith(" + docRootLit + ") and any(c in _mode for c in 'wax+') and (not _in_docs or not _ws_ready) and not getattr(_msb, '_ms_mem_warned', False):\n" +
+          "        _msb._ms_mem_warned = True\n" +
+          "        print('⚠️ pyodide 运行时在 Documents 之外写文件为内存态（App 重启即丢，多为库缓存可忽略）；需要持久化请写到 ~/Documents/ 下', file=_mssys.stderr)\n" +
           "    return _ms_orig_open(file, *a, **k)\n" +
           "_msb.open = _ms_guarded_open"
         );
