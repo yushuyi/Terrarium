@@ -247,6 +247,11 @@ def _make_pool_cls(base_cls, scheme):
             pass  # 沙箱无 socket；连接由原生代理完成
 
         _MSConnection.connect = _connect
+        # TLS 由原生 URLSession 代理层完成（系统信任库默认做完整证书
+        # 校验），urllib3 连接池按 is_verified 发 InsecureRequestWarning
+        # ——置 True 与事实一致，消除误导性警告（测试计划 I-7：
+        # 校验实际开启，警告为误报）
+        _MSConnection.is_verified = True
     return _MSConnection
 
 
