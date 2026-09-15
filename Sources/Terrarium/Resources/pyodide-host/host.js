@@ -478,7 +478,9 @@ async function runPython(id, code) {
     // CLI 语义：脚本 raise SystemExit(N) 是正常退出通道（含 0），不是
     // 异常。Pyodide 把 Python 异常统一转成 PythonError（message=traceback），
     // SystemExit 的退出码只能从 traceback 尾行 "SystemExit: N" 提取。
-    const sysExit = /(?:^|\n)SystemExit: (.+?)\s*(?:\n|$)/.exec(exception || "");
+    // 必须锚定尾行：链式 traceback（except SystemExit: raise ...）中部
+    // 出现的 SystemExit 不是最终异常，首匹配会误提取并吞掉真实错误。
+    const sysExit = /(?:^|\n)SystemExit: ([^\n]*)\s*$/.exec(exception || "");
     if (sysExit) {
       const c = sysExit[1];
       if (c === "None" || c === "") {
