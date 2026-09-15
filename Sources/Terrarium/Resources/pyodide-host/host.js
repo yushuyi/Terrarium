@@ -160,18 +160,6 @@ if "${sitePackages}" not in sys.path:
         window.__MS_LOCKFILE_FILES__ = files;
         window.__MS_LOCKFILE_DEPS__ = deps;
         window.__MS_PYODIDE_VERSION__ = pyodide.version;
-        // bundle 加载链路自检（一次性）：lockfile 包显式 loadPackage 是否
-        // 可用。结果进 bootWarnings 随首次 run 上报——loadPackagesFromImports
-        // 对 lockfile 包静默跳过时的关键观测点（真机实测缺口）
-        try {
-          await pyodide.loadPackage("matplotlib", {
-            messageCallback: () => {},
-            errorCallback: (m) => bootWarnings.push("selftest loadPackage(matplotlib) errorCallback: " + m),
-          });
-          bootWarnings.push("selftest loadPackage(matplotlib) OK");
-        } catch (e) {
-          bootWarnings.push("selftest loadPackage(matplotlib) EXC: " + String(e && e.message || e));
-        }
       }
     } catch (e) {
       bootWarnings.push("lockfile 映射注入失败，CDN 兜底不可用: " + String(e && e.message || e));
@@ -386,26 +374,15 @@ async function runPython(id, code) {
       // stdout（绿色）上屏；失败仍由外层 catch 与后续
       // ModuleNotFoundError 明确暴露
       const pkgImportErrors = new Set();
-      // 加载前后对比：区分「pyodide 没尝试加载」（数量不变且 errors 空）
-      // 与「尝试了但失败」（errors 非空）——lockfile 自动加载缺口排查
-      const loadedBefore = Object.keys(pyodide.loadedPackages || {}).length;
       await pyodide.loadPackagesFromImports(code, {
         messageCallback: () => {},
         // errorCallback 也须静默：bundle 未打包的 lockfile 包（如 pip 装
         // 进 persist 的 scipy）会连带 404 其声明依赖，红字杂音误导用户；
         // 真正的失败由用户代码的 ModuleNotFoundError 明确暴露。
-        // 但不再丢线索：收集后上报一条汇总（bundle 伺服排查观测点）
+        // 但不丢线索：收集后仅在失败时上报一条汇总（对齐 Mac 体验：
+        // 正常执行零噪音）
         errorCallback: (msg) => pkgImportErrors.add(String(msg)),
       });
-      const loadedAfter = Object.keys(pyodide.loadedPackages || {}).length;
-      if (currentRunId) {
-        post({
-          kind: "stderr",
-          id: currentRunId,
-          line: "[pyodide] 自动加载对比: " + loadedBefore + "→" + loadedAfter +
-            " 包, importErrors=" + pkgImportErrors.size,
-        });
-      }
       if (pkgImportErrors.size && currentRunId) {
         post({
           kind: "stderr",
