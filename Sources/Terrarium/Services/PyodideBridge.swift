@@ -325,6 +325,11 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// run_script 临时脚本自带 defer 删除 + 残留清扫，不会在快照累积
     private nonisolated static let wsExcludedPrefixes: Set<String> = [
         "Conversations/", "Memory/", "Inbox/", "CLIShims/", "backups/",
+        // 原生 CPython 的 pip 安装目录（PIL/defusedxml 等 + 大量 __pycache__）：
+        // 数千文件会把快照撑爆护栏（>2000 文件）导致整包跳过、MEMFS 退化为
+        // 隔离态（I-4 用例 Errno 44 的根因）；且原生 3.14 的包源码不应进入
+        // pyodide 3.13 的文件视图，pyodide 包体系走 persist zip 专用通道
+        ".python/",
     ]
     private nonisolated static let wsExcludedFiles: Set<String> = [
         "pyodide_persist.zip", "MCPServers.json",

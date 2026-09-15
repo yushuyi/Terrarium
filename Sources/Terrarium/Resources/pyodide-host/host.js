@@ -222,6 +222,10 @@ if "${sitePackages}" not in sys.path:
         await pyodide.runPythonAsync(
           "import os, builtins as _msb, sys as _mssys\n" +
           "os.environ['HOME'] = " + JSON.stringify(docRoot) + "\n" +
+          // cwd 对齐 Documents 根：emscripten 的 FS.chdir 在 boot 时用默认
+          // HOME(/home/pyodide) 已执行，env.HOME 后置修改不影响 cwd，
+          // 相对路径 open 会落在 /home/pyodide 下（实测 O-4 Errno 44）
+          "os.chdir(" + JSON.stringify(docRoot) + " + '/Documents')\n" +
           "_ms_orig_open = _msb.open\n" +
           "def _ms_guarded_open(file, *a, **k):\n" +
           "    try:\n" +
