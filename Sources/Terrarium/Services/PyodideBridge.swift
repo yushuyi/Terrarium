@@ -128,6 +128,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
         webView.isAccessibilityElement = false
         webView.accessibilityElementsHidden = true
         window.addSubview(webView)
+        os_log("[Pyodide] webview 已挂窗 scene=%{public}@ window=%{public}@", log: Log.pyodide, type: .info,
+               window.windowScene?.activationState.rawValue.description ?? "nil", String(describing: window))
         #endif
     }
 
@@ -280,10 +282,12 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 预热：提前触发 bootstrap（wasm 编译 + micropip 就绪），首次执行零等待。
     /// 幂等——内部收敛到 awaitReady，与首次执行并发安全。
     public func prewarm() {
+        os_log("[Pyodide] prewarm 调用", log: Log.pyodide, type: .info)
         Task { @MainActor [weak self] in
             guard self != nil else { return }
             try? await PyodideBridge.shared.awaitReady()
-            NSLog("[Pyodide] 预热完成")
+            // SPM 包内 NSLog 不落 syslog（采不到即误判预热未跑），必须 os_log
+            os_log("[Pyodide] 预热完成", log: Log.pyodide, type: .info)
         }
     }
 
