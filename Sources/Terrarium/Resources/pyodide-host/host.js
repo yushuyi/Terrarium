@@ -475,6 +475,21 @@ async function runPython(id, code) {
   } catch (e) {
     exception = String(e && e.message || e);
     exitCode = 1;
+    // CLI 语义：脚本 raise SystemExit(N) 是正常退出通道（含 0），不是
+    // 异常。Pyodide 把 Python 异常统一转成 PythonError（message=traceback），
+    // SystemExit 的退出码只能从 traceback 尾行 "SystemExit: N" 提取。
+    const sysExit = /(?:^|\n)SystemExit: (.+?)\s*(?:\n|$)/.exec(exception || "");
+    if (sysExit) {
+      const c = sysExit[1];
+      if (c === "None" || c === "") {
+        exitCode = 0;
+      } else if (/^-?\d+$/.test(c)) {
+        exitCode = parseInt(c, 10);
+      } else {
+        exitCode = 1; // SystemExit("错误消息") → 1，与 CPython 语义一致
+      }
+      exception = null;
+    }
   } finally {
     // 工作区收集：用户 code 抛异常也可能写过文件，成功失败都要收集
     const wsGlobals = pyodide.toPy({});
