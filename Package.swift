@@ -25,9 +25,15 @@ let package = Package(
     products: [
         .library(name: "Terrarium", targets: ["Terrarium"]),
     ],
+    dependencies: [
+        .package(path: "../MSFoundation"),
+    ],
     targets: [
         .target(
             name: "Terrarium",
+            dependencies: [
+                .product(name: "MSFoundation", package: "MSFoundation"),
+            ],
             path: "Sources/Terrarium",
             resources: [
                 // Pyodide WKWebView 宿主页（host.html / host.js）
