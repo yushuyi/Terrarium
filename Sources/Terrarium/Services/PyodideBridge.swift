@@ -24,6 +24,7 @@
 import Foundation
 import os
 import WebKit
+import MSFoundation
 
 @MainActor
 public enum Log {
@@ -129,7 +130,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
         webView.isAccessibilityElement = false
         webView.accessibilityElementsHidden = true
         window.addSubview(webView)
-        os_log("[Pyodide] webview 已挂窗 scene=%{public}@ window=%{public}@", log: Log.pyodide, type: .info,
+        AppLog.log("[Pyodide] webview 已挂窗 scene=%{public}@ window=%{public}@", log: Log.pyodide, type: .info,
                window.windowScene?.activationState.rawValue.description ?? "nil", String(describing: window))
         #endif
     }
@@ -173,14 +174,14 @@ public final class PyodideBridge: NSObject, ObservableObject {
            let seed = Bundle.module.url(forResource: "pyodide_persist_seed", withExtension: "zip") {
             do {
                 try FileManager.default.copyItem(at: seed, to: zipURL)
-                os_log("[Pyodide] 全新安装：释放 persist 预装种子", log: Log.pyodide)
+                AppLog.log("[Pyodide] 全新安装：释放 persist 预装种子", log: Log.pyodide)
             } catch {
-                os_log("[Pyodide] 种子释放失败: %{public}s", log: Log.pyodide, String(describing: error))
+                AppLog.log("[Pyodide] 种子释放失败: %{public}s", log: Log.pyodide, String(describing: error))
             }
         }
         let data = (try? Data(contentsOf: zipURL))
         let b64 = data?.base64EncodedString() ?? ""
-        os_log("[Pyodide] seedPersistMirror 启动 b64len=%{public}lu", log: Log.pyodide, UInt(b64.count))
+        AppLog.log("[Pyodide] seedPersistMirror 启动 b64len=%{public}lu", log: Log.pyodide, UInt(b64.count))
         seedGeneration += 1
         let generation = seedGeneration
         Task { @MainActor [weak self] in
@@ -194,7 +195,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
             while probes < 60 {
                 guard let self else { return }
                 guard generation == self.seedGeneration else {
-                    os_log("[Pyodide] seedPersist 代数过期（页面已重载），放弃注入", log: Log.pyodide)
+                    AppLog.log("[Pyodide] seedPersist 代数过期（页面已重载），放弃注入", log: Log.pyodide)
                     return
                 }
                 let probe = await self.evaluate(
@@ -212,10 +213,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
             }
             guard let self, self.webView != nil else { return }
             guard generation == self.seedGeneration, sawReady else {
-                os_log("[Pyodide] seedPersist 页面未就绪或已重载（%{public}ld 次探针），跳过注入", log: Log.pyodide, probes)
+                AppLog.log("[Pyodide] seedPersist 页面未就绪或已重载（%{public}ld 次探针），跳过注入", log: Log.pyodide, probes)
                 return
             }
-            os_log("[Pyodide] seedPersist 页面就绪（%{public}ld 次探针）开始注入 epoch=%{public}@",
+            AppLog.log("[Pyodide] seedPersist 页面就绪（%{public}ld 次探针）开始注入 epoch=%{public}@",
                    log: Log.pyodide, probes, epoch)
             // 分块注入，单次 evaluate 传 MB 级字符串易触发 WebKit 上限。
             // 每块脚本内联 epoch 校验：页面中途重载（超时/异常再重载）时，
@@ -225,7 +226,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 var idx = b64.startIndex
                 while idx < b64.endIndex {
                     guard generation == self.seedGeneration else {
-                        os_log("[Pyodide] seedPersist 注入中止（代数过期，已注入 %{public}d 块）",
+                        AppLog.log("[Pyodide] seedPersist 注入中止（代数过期，已注入 %{public}d 块）",
                                log: Log.pyodide, Int32(injected))
                         return
                     }
@@ -246,10 +247,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 "String(window.__MS_PERSIST_B64__ ? window.__MS_PERSIST_B64__.length : 0)"
             )
             if got == String(b64.count) {
-                os_log("[Pyodide] 持久化镜像注入完成 镜像=%{public}@ 块数=%{public}d 长度校验一致",
+                AppLog.log("[Pyodide] 持久化镜像注入完成 镜像=%{public}@ 块数=%{public}d 长度校验一致",
                        log: Log.pyodide, b64.isEmpty ? "无" : "有", Int32(injected))
             } else {
-                os_log("[Pyodide] 持久化镜像注入长度不符 期望=%{public}@ 实际=%{public}@，清空按无镜像放行",
+                AppLog.log("[Pyodide] 持久化镜像注入长度不符 期望=%{public}@ 实际=%{public}@，清空按无镜像放行",
                        log: Log.pyodide, String(b64.count), got.isEmpty ? "0" : got)
                 // 清空也走 epoch 校验 + 返回值判定：与块注入防线一致。
                 // 迟到的清空若落在新页面，会把新页刚注入的合法 b64 置 ''——
@@ -258,7 +259,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
                     "if (window.__MS_PERSIST_EPOCH__ === '\(epoch)') { window.__MS_PERSIST_B64__ = ''; 'cleared' } else { 'stale' }"
                 )
                 if cleared.isEmpty {
-                    os_log("[Pyodide] 持久化镜像清空确认超时（页面可能已重载），按无镜像放行",
+                    AppLog.log("[Pyodide] 持久化镜像清空确认超时（页面可能已重载），按无镜像放行",
                            log: Log.pyodide)
                 }
             }
@@ -271,7 +272,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 "if (window.__MS_PERSIST_EPOCH__ === '\(epoch)') { window.__MS_DOCROOT__ = '\(NSHomeDirectory())'; 'docroot' } else { 'stale' }"
             )
             if docroot == "stale" {
-                os_log("[Pyodide] 注入尾段检测到页面重载（stale），本代注入终止", log: Log.pyodide)
+                AppLog.log("[Pyodide] 注入尾段检测到页面重载（stale），本代注入终止", log: Log.pyodide)
                 return
             }
             _ = await self.evaluate(
@@ -293,19 +294,19 @@ public final class PyodideBridge: NSObject, ObservableObject {
             .appendingPathComponent("pyodide_persist.zip")
         guard !base64.isEmpty else {
             try? FileManager.default.removeItem(at: url)
-            os_log("[Pyodide] 持久化镜像已删除（卸载/清空同步）", log: Log.pyodide)
+            AppLog.log("[Pyodide] 持久化镜像已删除（卸载/清空同步）", log: Log.pyodide)
             return
         }
         guard let data = Data(base64Encoded: base64),
               data.starts(with: [0x50, 0x4B]) else { // PK zip 魔数
-            os_log("[Pyodide] 持久化镜像数据无效（解码失败或非 zip），保留原镜像", log: Log.pyodide)
+            AppLog.log("[Pyodide] 持久化镜像数据无效（解码失败或非 zip），保留原镜像", log: Log.pyodide)
             return
         }
         do {
             try data.write(to: url, options: .atomic)
-            os_log("[Pyodide] 持久化镜像已落盘 %{public}ld 字节", log: Log.pyodide, data.count)
+            AppLog.log("[Pyodide] 持久化镜像已落盘 %{public}ld 字节", log: Log.pyodide, data.count)
         } catch {
-            os_log("[Pyodide] 持久化镜像写入失败: %{public}@", log: Log.pyodide, String(describing: error))
+            AppLog.log("[Pyodide] 持久化镜像写入失败: %{public}@", log: Log.pyodide, String(describing: error))
         }
     }
 
@@ -332,12 +333,12 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 预热：提前触发 bootstrap（wasm 编译 + micropip 就绪），首次执行零等待。
     /// 幂等——内部收敛到 awaitReady，与首次执行并发安全。
     public func prewarm() {
-        os_log("[Pyodide] prewarm 调用", log: Log.pyodide, type: .info)
+        AppLog.log("[Pyodide] prewarm 调用", log: Log.pyodide, type: .info)
         Task { @MainActor [weak self] in
             guard self != nil else { return }
             try? await PyodideBridge.shared.awaitReady()
             // SPM 包内 NSLog 不落 syslog（采不到即误判预热未跑），必须 os_log
-            os_log("[Pyodide] 预热完成", log: Log.pyodide, type: .info)
+            AppLog.log("[Pyodide] 预热完成", log: Log.pyodide, type: .info)
         }
     }
 
@@ -497,7 +498,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
             return "" // MEMFS 与宿主一致，零开销跳过
         }
         guard let fingerprint = documentsFingerprint() else {
-            os_log("[Pyodide] 工作区快照跳过：Documents 超护栏（>32MB 或 >2000 文件）",
+            AppLog.log("[Pyodide] 工作区快照跳过：Documents 超护栏（>32MB 或 >2000 文件）",
                    log: Log.pyodide)
             return ""
         }
@@ -520,13 +521,13 @@ public final class PyodideBridge: NSObject, ObservableObject {
         let actual = await evaluate("String(window.__MS_WS_B64__ ? window.__MS_WS_B64__.length : 0)")
         guard actual == String(payload.utf16.count) else {
             _ = await evaluate("window.__MS_WS_B64__ = null; 'ok'")
-            os_log("[Pyodide] 工作区快照注入长度校验失败（期望 %{public}ld 实际 %{public}@），本轮不恢复",
+            AppLog.log("[Pyodide] 工作区快照注入长度校验失败（期望 %{public}ld 实际 %{public}@），本轮不恢复",
                    log: Log.pyodide, Int32(payload.utf16.count), actual)
             return ""
         }
         wsLastFingerprint = fingerprint
         wsInjectedIntoCurrentPage = true
-        os_log("[Pyodide] 工作区快照注入完成 文件数=%{public}ld payload=%{public}ld 字节",
+        AppLog.log("[Pyodide] 工作区快照注入完成 文件数=%{public}ld payload=%{public}ld 字节",
                log: Log.pyodide, Int32(entries.count), Int32(payload.utf8.count))
         return ""
     }
@@ -541,7 +542,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let writes = obj["w"] as? [String: String],
               let deletes = obj["d"] as? [String] else {
-            os_log("[Pyodide] 工作区收集载荷无效，忽略", log: Log.pyodide)
+            AppLog.log("[Pyodide] 工作区收集载荷无效，忽略", log: Log.pyodide)
             done()
             return
         }
@@ -557,7 +558,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 self.wsLastFingerprint = self.documentsFingerprint()
                 self.wsInjectedIntoCurrentPage = !result.failed
                 if result.applied > 0 {
-                    os_log("[Pyodide] 工作区收集写回 %{public}ld 个文件", log: Log.pyodide, Int32(result.applied))
+                    AppLog.log("[Pyodide] 工作区收集写回 %{public}ld 个文件", log: Log.pyodide, Int32(result.applied))
                 }
                 done()
             }
@@ -594,7 +595,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
             guard let tail = validatedRel(rel),
                   let target = validatedTarget(tail),
                   let content = Data(base64Encoded: b64) else {
-                os_log("[Pyodide] 工作区写回拒绝非法路径: %{public}@（越界/排除集/载荷无效）", log: Log.pyodide, rel)
+                AppLog.log("[Pyodide] 工作区写回拒绝非法路径: %{public}@（越界/排除集/载荷无效）", log: Log.pyodide, rel)
                 continue
             }
             try? fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -603,7 +604,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 applied += 1
             } catch {
                 failed = true
-                os_log("[Pyodide] 工作区写回失败 %{public}@: %{public}@", log: Log.pyodide, rel, String(describing: error))
+                AppLog.log("[Pyodide] 工作区写回失败 %{public}@: %{public}@", log: Log.pyodide, rel, String(describing: error))
             }
         }
         for rel in deletes {
@@ -612,7 +613,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 try fm.removeItem(at: target)
             } catch {
                 failed = true
-                os_log("[Pyodide] 工作区删除失败 %{public}@: %{public}@", log: Log.pyodide, rel, String(describing: error))
+                AppLog.log("[Pyodide] 工作区删除失败 %{public}@: %{public}@", log: Log.pyodide, rel, String(describing: error))
             }
         }
         return (applied, failed)
