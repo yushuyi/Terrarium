@@ -72,7 +72,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
 
     // MARK: Lifecycle
 
-    public override init() {
+    /// ponytail: 单例语义，init 收私有防第二实例导致 lastKnownPersistEpoch 分叉
+    private override init() {
         super.init()
         // 类是 @MainActor，init 已在主 actor 上——同步初始化。
         // 不能用 Task 调度：首次访问 shared 的调用方可能先于该 Task
@@ -263,11 +264,19 @@ public final class PyodideBridge: NSObject, ObservableObject {
             }
             // 容器根注入：host.js bootstrap 用它固化 pyodide 的 HOME
             // （与原生 CPython 的 PythonBridge.m setenv 对齐），须在
-            // SEEDED 置位前就绪。容器 UUID 路径不含引号，直接拼接安全
-            _ = await self.evaluate(
-                "window.__MS_DOCROOT__ = '\(NSHomeDirectory())'; 'docroot'"
+            // SEEDED 置位前就绪。容器 UUID 路径不含引号，直接拼接安全。
+            // 尾段同样套 epoch 守卫：重载落在末块与 SEEDED 置位之间时，
+            // 旧 Task 不得在新页提前置 SEEDED（否则新页按撕裂/空镜像放行）
+            let docroot = await self.evaluate(
+                "if (window.__MS_PERSIST_EPOCH__ === '\(epoch)') { window.__MS_DOCROOT__ = '\(NSHomeDirectory())'; 'docroot' } else { 'stale' }"
             )
-            _ = await self.evaluate("window.__MS_PERSIST_SEEDED__ = true; 'seeded'")
+            if docroot == "stale" {
+                os_log("[Pyodide] 注入尾段检测到页面重载（stale），本代注入终止", log: Log.pyodide)
+                return
+            }
+            _ = await self.evaluate(
+                "if (window.__MS_PERSIST_EPOCH__ === '\(epoch)') { window.__MS_PERSIST_SEEDED__ = true; 'seeded' } else { 'stale' }"
+            )
         }
     }
 
