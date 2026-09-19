@@ -78,6 +78,10 @@ async function bootstrap() {
     // window 缺失属性抛 AttributeError，必须先初始化
     window.__MS_WS_READY__ = false;
 
+    // 页面代数戳：每次 bootstrap 生成新值，Swift 注入侧据此确认「当前
+    // evaluate 落在本页」——旧页面残留的等待标志不再被误认（重载竞态
+    // 曾把镜像注入撕裂到新旧两页 → BadZipFile → 三方包全丢）
+    window.__MS_PERSIST_EPOCH__ = String(Date.now()) + '-' + Math.random().toString(36).slice(2, 8);
     // 等待 Swift 注入持久化镜像（window.__MS_PERSIST_B64__，见
     // PyodideBridge.seedPersistMirror）。旧宿主/无镜像时 15s 超时放行。
     // __MS_PERSIST_WAIT__ 是 Swift 轮询的「页面 JS 已就绪」信号。
@@ -99,6 +103,12 @@ async function bootstrap() {
       bootWarnings.push("持久化镜像注入等待超时（宿主未置 SEEDED）");
     }
     if (window.__MS_PERSIST_B64__) {
+      // 防线：注入侧撕裂检测兜底——b64 长度非 4 的倍数必然解码失败，
+      // 直接按无镜像放行，绝不把残缺数据交给 zipfile（曾致 BadZipFile）
+      if (window.__MS_PERSIST_B64__.length % 4 !== 0) {
+        bootWarnings.push("持久化镜像注入长度非 4 倍数（" + window.__MS_PERSIST_B64__.length + "），按无镜像放行");
+        window.__MS_PERSIST_B64__ = null;
+      } else {
       try {
         await pyodide.runPythonAsync(
           "import base64, io, zipfile\n" +
@@ -113,6 +123,7 @@ async function bootstrap() {
       } finally {
         // 释放 JS 侧大字符串（恢复已完成/已失败，内存不再需要）
         window.__MS_PERSIST_B64__ = null;
+      }
       }
     }
 

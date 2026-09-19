@@ -151,6 +151,14 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 把 Documents 里的持久化镜像（pip 已装包的 zip）注入运行时。
     /// host.js 的 bootstrap 会等待 __MS_PERSIST_SEEDED__（15s 超时兜底），
     /// 本方法轮询页面 JS 就绪后分块注入，注入完成置位。
+    ///
+    /// 重载竞态防线（2026-09-18 事故）：loadHostPage 后旧页面尚未 commit、
+    /// 新页面 bootstrap 未跑完时，探针可能命中旧页面残留的等待标志，把镜像
+    /// 撕裂注入到新旧两页（差值恰为整块 + "undefined" 9 字符前缀）。三层防御：
+    /// 1. epoch 绑定——探针必须读到「与上次已知值不同的新戳」才算新页面就绪；
+    /// 2. chunk 级中止——每块注入脚本内联 epoch 校验，页面中途重载立即失效；
+    /// 3. 撕裂兜底——长度校验失败时清空注入串，让 bootstrap 按「无镜像」放行，
+    ///    绝不把残缺数据交给 zipfile（BadZipFile 曾致三方包全丢）。
     private func seedPersistMirror() {
         let zipURL = FileManager.default
             .urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -176,18 +184,26 @@ public final class PyodideBridge: NSObject, ObservableObject {
         let generation = seedGeneration
         Task { @MainActor [weak self] in
             // 等 host.js 设出等待标志（页面 JS 环境就绪）；每次 probe 最多
-            // 1s（超时竞速），60 次为预算上限，页面始终未就绪则放弃注入
+            // 1s（超时竞速），60 次为预算上限，页面始终未就绪则放弃注入。
+            // epoch 绑定：探针读到「与上次已知值不同的新戳」才认定本页就绪，
+            // 旧页面残留的等待标志不会命中（旧页戳 == 上次已知值）
             var probes = 0
             var sawReady = false
+            var epoch = ""
             while probes < 60 {
                 guard let self else { return }
                 guard generation == self.seedGeneration else {
                     os_log("[Pyodide] seedPersist 代数过期（页面已重载），放弃注入", log: Log.pyodide)
                     return
                 }
-                let probe = await self.evaluate("typeof window.__MS_PERSIST_WAIT__")
+                let probe = await self.evaluate(
+                    "String(window.__MS_PERSIST_EPOCH__ || (window.__MS_PERSIST_WAIT__ ? 'legacy-wait' : ''))"
+                )
                 probes += 1
-                if probe == "boolean" {
+                if !probe.isEmpty && probe != Self.lastKnownPersistEpoch {
+                    // 新戳 = 新页面 bootstrap 已跑到这里；记录为已知值
+                    Self.lastKnownPersistEpoch = probe
+                    epoch = probe
                     sawReady = true
                     break
                 }
@@ -198,23 +214,33 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 os_log("[Pyodide] seedPersist 页面未就绪或已重载（%{public}ld 次探针），跳过注入", log: Log.pyodide, probes)
                 return
             }
-            os_log("[Pyodide] seedPersist 页面就绪（%{public}ld 次探针）开始注入", log: Log.pyodide, probes)
-            // 分块注入，单次 evaluate 传 MB 级字符串易触发 WebKit 上限
+            os_log("[Pyodide] seedPersist 页面就绪（%{public}ld 次探针）开始注入 epoch=%{public}@",
+                   log: Log.pyodide, probes, epoch)
+            // 分块注入，单次 evaluate 传 MB 级字符串易触发 WebKit 上限。
+            // 每块脚本内联 epoch 校验：页面中途重载（超时/异常再重载）时，
+            // 剩余块在新页面上整段 no-op，绝不落到 undefined 变量上
             var injected = 0
             if !b64.isEmpty {
                 var idx = b64.startIndex
                 while idx < b64.endIndex {
+                    guard generation == self.seedGeneration else {
+                        os_log("[Pyodide] seedPersist 注入中止（代数过期，已注入 %{public}d 块）",
+                               log: Log.pyodide, Int32(injected))
+                        return
+                    }
                     let end = b64.index(idx, offsetBy: 1_000_000, limitedBy: b64.endIndex) ?? b64.endIndex
                     let chunk = String(b64[idx..<end])
                     let op = injected == 0 ? "=" : "+="
                     _ = await self.evaluate(
-                        "window.__MS_PERSIST_B64__ \(op) '\(chunk)'; 'ok'"
+                        "if (window.__MS_PERSIST_EPOCH__ === '\(epoch)') { window.__MS_PERSIST_B64__ \(op) '\(chunk)'; 'ok' } else { 'stale' }"
                     )
                     injected += 1
                     idx = end
                 }
             }
-            // M3 校验：比对页面侧实际长度，任何一块 evaluate 丢失都能在此暴露
+            // M3 校验：比对页面侧实际长度，任何一块 evaluate 丢失都能在此暴露。
+            // 失败 = 注入撕裂/丢失：清空注入串走「无镜像」路径（bootstrap 对
+            // 空 b64 直接跳过恢复），绝不把残缺数据交给 zipfile
             let got = await self.evaluate(
                 "String(window.__MS_PERSIST_B64__ ? window.__MS_PERSIST_B64__.length : 0)"
             )
@@ -222,8 +248,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 os_log("[Pyodide] 持久化镜像注入完成 镜像=%{public}@ 块数=%{public}d 长度校验一致",
                        log: Log.pyodide, b64.isEmpty ? "无" : "有", Int32(injected))
             } else {
-                os_log("[Pyodide] 持久化镜像注入长度不符 期望=%{public}ld 实际=%{public}@（本次会话可能无包）",
+                os_log("[Pyodide] 持久化镜像注入长度不符 期望=%{public}ld 实际=%{public}@，清空按无镜像放行",
                        log: Log.pyodide, b64.count, got.isEmpty ? "0" : got)
+                _ = await self.evaluate("window.__MS_PERSIST_B64__ = ''; 'cleared'")
             }
             // 容器根注入：host.js bootstrap 用它固化 pyodide 的 HOME
             // （与原生 CPython 的 PythonBridge.m setenv 对齐），须在
@@ -234,6 +261,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
             _ = await self.evaluate("window.__MS_PERSIST_SEEDED__ = true; 'seeded'")
         }
     }
+
+    /// 上一次注入认定的页面 epoch（跨 loadHostPage 保留）：探针只有读到
+    /// 与之不同的新戳才认定新页面就绪，旧页面残留标志不会再次命中
+    private static var lastKnownPersistEpoch = ""
 
     /// 持久化镜像落盘：b64 非空 → 原子写入 Documents（仅接受 zip 魔数，
     /// 防标记行伪造/数据损坏后覆盖好镜像）；b64 空串 → 删除镜像（卸载/清空同步）。
