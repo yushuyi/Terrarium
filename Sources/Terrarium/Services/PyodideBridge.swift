@@ -200,9 +200,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
                     "String(window.__MS_PERSIST_EPOCH__ || (window.__MS_PERSIST_WAIT__ ? 'legacy-wait' : ''))"
                 )
                 probes += 1
-                if !probe.isEmpty && probe != Self.lastKnownPersistEpoch {
+                if !probe.isEmpty && probe != lastKnownPersistEpoch {
                     // 新戳 = 新页面 bootstrap 已跑到这里；记录为已知值
-                    Self.lastKnownPersistEpoch = probe
+                    lastKnownPersistEpoch = probe
                     epoch = probe
                     sawReady = true
                     break
@@ -248,9 +248,18 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 os_log("[Pyodide] 持久化镜像注入完成 镜像=%{public}@ 块数=%{public}d 长度校验一致",
                        log: Log.pyodide, b64.isEmpty ? "无" : "有", Int32(injected))
             } else {
-                os_log("[Pyodide] 持久化镜像注入长度不符 期望=%{public}ld 实际=%{public}@，清空按无镜像放行",
-                       log: Log.pyodide, b64.count, got.isEmpty ? "0" : got)
-                _ = await self.evaluate("window.__MS_PERSIST_B64__ = ''; 'cleared'")
+                os_log("[Pyodide] 持久化镜像注入长度不符 期望=%{public}@ 实际=%{public}@，清空按无镜像放行",
+                       log: Log.pyodide, String(b64.count), got.isEmpty ? "0" : got)
+                // 清空也走 epoch 校验 + 返回值判定：与块注入防线一致。
+                // 迟到的清空若落在新页面，会把新页刚注入的合法 b64 置 ''——
+                // 由新页 bootstrap 的 4 倍数防线兜底（本次会话无包，不崩溃）
+                let cleared = await self.evaluate(
+                    "if (window.__MS_PERSIST_EPOCH__ === '\(epoch)') { window.__MS_PERSIST_B64__ = ''; 'cleared' } else { 'stale' }"
+                )
+                if cleared.isEmpty {
+                    os_log("[Pyodide] 持久化镜像清空确认超时（页面可能已重载），按无镜像放行",
+                           log: Log.pyodide)
+                }
             }
             // 容器根注入：host.js bootstrap 用它固化 pyodide 的 HOME
             // （与原生 CPython 的 PythonBridge.m setenv 对齐），须在
@@ -263,8 +272,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
     }
 
     /// 上一次注入认定的页面 epoch（跨 loadHostPage 保留）：探针只有读到
-    /// 与之不同的新戳才认定新页面就绪，旧页面残留标志不会再次命中
-    private static var lastKnownPersistEpoch = ""
+    /// 与之不同的新戳才认定新页面就绪，旧页面残留标志不会再次命中。
+    /// ponytail: 整类 @MainActor，实例属性与 static 语义等价，用实例免 Swift 6 报警
+    private var lastKnownPersistEpoch = ""
 
     /// 持久化镜像落盘：b64 非空 → 原子写入 Documents（仅接受 zip 魔数，
     /// 防标记行伪造/数据损坏后覆盖好镜像）；b64 空串 → 删除镜像（卸载/清空同步）。

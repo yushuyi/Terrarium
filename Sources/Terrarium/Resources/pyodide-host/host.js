@@ -109,21 +109,21 @@ async function bootstrap() {
         bootWarnings.push("持久化镜像注入长度非 4 倍数（" + window.__MS_PERSIST_B64__.length + "），按无镜像放行");
         window.__MS_PERSIST_B64__ = null;
       } else {
-      try {
-        await pyodide.runPythonAsync(
-          "import base64, io, zipfile\n" +
-          "_b64 = __import__('js').window.__MS_PERSIST_B64__ or ''\n" +
-          "_z = zipfile.ZipFile(io.BytesIO(base64.b64decode(_b64)))\n" +
-          "_n = len(_z.namelist())\n" +
-          "_z.extractall('/persist')\n" +
-          "print('[pyodide] 已从原生镜像恢复 ' + str(_n) + ' 个持久化文件')\n"
-        );
-      } catch (e) {
-        bootWarnings.push("持久化镜像恢复失败: " + String(e));
-      } finally {
-        // 释放 JS 侧大字符串（恢复已完成/已失败，内存不再需要）
-        window.__MS_PERSIST_B64__ = null;
-      }
+        try {
+          await pyodide.runPythonAsync(
+            "import base64, io, zipfile\n" +
+            "_b64 = __import__('js').window.__MS_PERSIST_B64__ or ''\n" +
+            "_z = zipfile.ZipFile(io.BytesIO(base64.b64decode(_b64)))\n" +
+            "_n = len(_z.namelist())\n" +
+            "_z.extractall('/persist')\n" +
+            "print('[pyodide] 已从原生镜像恢复 ' + str(_n) + ' 个持久化文件')\n"
+          );
+        } catch (e) {
+          bootWarnings.push("持久化镜像恢复失败: " + String(e));
+        } finally {
+          // 释放 JS 侧大字符串（恢复已完成/已失败，内存不再需要）
+          window.__MS_PERSIST_B64__ = null;
+        }
       }
     }
 
