@@ -396,6 +396,15 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// run_script 临时脚本自带 defer 删除 + 残留清扫，不会在快照累积
     private nonisolated static let wsExcludedPrefixes: Set<String> = [
         "Conversations/", "Memory/", "Inbox/", "CLIShims/", "backups/",
+        // node 原生运行时的包目录（docx/pptxgenjs/jszip 等 JS 库，
+        // 实测 14.8MB/581 文件、占快照体积 64%）：node 进程在原生侧直接
+        // 读磁盘，pyodide 内无 subprocess 也无读取场景——注入纯属白搬，
+        // 是 jetsam 载荷的主力
+        "node_modules/",
+        // App 会话搜索库（SQLite + WAL/SHM，~3.1MB）：原生侧高频读写，
+        // pyodide 无读取场景。此前文件名清单只排了 Documents 根同名文件，
+        // 实际库在子目录里漏网（快照打包预演实测发现）
+        "SessionSearch/",
         // 原生 CPython 的 pip 安装目录（PIL/defusedxml 等 + 大量 __pycache__）：
         // 数千文件会把快照撑爆护栏（>2000 文件）导致整包跳过、MEMFS 退化为
         // 隔离态（I-4 用例 Errno 44 的根因）；且原生 3.14 的包源码不应进入
