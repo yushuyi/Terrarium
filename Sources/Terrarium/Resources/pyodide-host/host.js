@@ -504,10 +504,74 @@ async function runPython(id, code) {
   };
 
   try {
-    // Mac 语义：缺包不自动安装。ModuleNotFoundError 等错误原样抛出，
-    // 由终端呈现真实 traceback（exit 1）；补装依赖走显式 `pip install`
-    // 命令（TerminalBridge 把 pip 转发到本运行时的 micropip）。
-    await runUser();
+    // Mac 语义对齐（缺包自动补装）：ModuleNotFoundError 时提取缺失模块名，
+    // micropip 安装（persist 持久化，与终端 pip 同语义）后限一次重跑。
+    // 与 cpython→pyodide 的 87 信号链对称，补全双向兜底；开关
+    // pyodide.autoInstall.enabled（UserDefaults，默认开）可整体关闭。
+    // 失败回退原始 traceback（不吞错）。
+    const autoInstallEnabled =
+      window.__MS_AUTO_INSTALL__ !== false; // Swift 侧按 UserDefaults 注入
+    try {
+      await runUser();
+    } catch (firstErr) {
+      const firstMsg = String(firstErr && firstErr.message || firstErr);
+      const missing = autoInstallEnabled
+        ? /(?:^|\n)ModuleNotFoundError: No module named '([^'\w])?([\w.]+)'/.exec(firstMsg)
+        : null;
+      // 标准库/运行时内部模块不装（webbrowser/ctypes 等在 iOS 无意义），
+      // 相对导入（.foo）不是包名；限一次重跑防循环
+      const STDLIB_SKIP = new Set([
+        "webbrowser", "ctypes", "multiprocessing", "tkinter", "curses",
+        "distutils", "ensurepip", "venv", "subprocess", "pty", "tty",
+        "readline", "sqlite3.test", "test",
+      ]);
+      const modName = missing ? missing[2] : null;
+      const rootName = modName ? modName.split(".")[0] : null;
+      if (!modName || missing[1] || STDLIB_SKIP.has(rootName)) throw firstErr;
+      if (currentRunId !== null) {
+        post({ kind: "stderr", id: currentRunId,
+               line: `[pyodide] 缺少 ${modName}，自动安装后重跑…` });
+      }
+      try {
+        await pyodide.loadPackage("micropip", { messageCallback: () => {}, errorCallback: () => {} });
+        await pyodide.runPythonAsync(
+          `import micropip as _ms_mip, asyncio as _ms_aio
+_ms_t = _ms_aio.ensure_future(_ms_mip.install([${JSON.stringify(modName)}]))
+while not _ms_t.done():
+    await _ms_aio.sleep(0.05)
+_ms_t.result()`
+        );
+        // persist 落盘：与终端 pip 壳同款 zip 镜像（经 stdout 标记行回传
+        // Swift storePersistMirror），否则装完重启即丢
+        persistB64 = "";
+        await pyodide.runPythonAsync(`
+import io as _io, os as _os, zipfile as _zip, base64 as _b64
+_buf = _io.BytesIO()
+_n = 0
+_z = _zip.ZipFile(_buf, 'w', _zip.ZIP_DEFLATED)
+for _root, _dirs, _files in _os.walk('${PERSIST_DIR}/site-packages'):
+    for _f in _files:
+        _p = _os.path.join(_root, _f)
+        _z.write(_p, _os.path.relpath(_p, '${PERSIST_DIR}'))
+        _n += 1
+_z.close()
+if _n:
+    print('__TERRARIUM_PERSIST_B64__:' + _b64.b64encode(_buf.getvalue()).decode())
+`);
+        if (currentRunId !== null) {
+          post({ kind: "stderr", id: currentRunId,
+                 line: `[pyodide] 已自动安装 ${modName}，重跑脚本（副作用会执行两遍）` });
+        }
+        // 重跑前清掉用户代码残留的 stdout 缓冲与 figure 状态，对齐首跑起点
+        stdoutBuf = "";
+        try { await pyodide.runPythonAsync("globals().get('_ms_saved_figs', set()).clear()"); } catch (_) {}
+        await runUser();
+      } catch (retryErr) {
+        // 自动安装失败或重跑仍失败：呈现第二次的真实错误（更接近根因）
+        exception = String(retryErr && retryErr.message || retryErr);
+        exitCode = 1;
+      }
+    }
   } catch (e) {
     exception = String(e && e.message || e);
     exitCode = 1;

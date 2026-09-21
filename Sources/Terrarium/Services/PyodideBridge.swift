@@ -275,6 +275,13 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 AppLog.log("[Pyodide] 注入尾段检测到页面重载（stale），本代注入终止", log: Log.pyodide)
                 return
             }
+            // 缺包自动安装开关（host.js catch 段读取；默认开，对齐 Mac
+            // 「装过就能用」体验）。UserDefaults 关闭后 host.js 原样抛
+            // ModuleNotFoundError（旧行为）
+            let autoInstall = UserDefaults.standard.object(forKey: "pyodide.autoInstall.enabled") as? Bool ?? true
+            _ = await self.evaluate(
+                "if (window.__MS_PERSIST_EPOCH__ === '\(epoch)') { window.__MS_AUTO_INSTALL__ = \(autoInstall); 'flag' } else { 'stale' }"
+            )
             _ = await self.evaluate(
                 "if (window.__MS_PERSIST_EPOCH__ === '\(epoch)') { window.__MS_PERSIST_SEEDED__ = true; 'seeded' } else { 'stale' }"
             )
