@@ -184,12 +184,16 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 AppLog.log("[Pyodide] 种子释放失败: %{public}s", log: Log.pyodide, String(describing: error))
             }
         }
-        let data = (try? Data(contentsOf: zipURL))
-        let b64 = data?.base64EncodedString() ?? ""
-        AppLog.log("[Pyodide] seedPersistMirror 启动 b64len=%{public}lu", log: Log.pyodide, UInt(b64.count))
         seedGeneration += 1
         let generation = seedGeneration
         Task { @MainActor [weak self] in
+            // zip 读取 + b64 编码放后台（review P2-2）：几十 MB 的 IO+编码
+            // 同步跑在主线程卡数百 ms~s，death→reload 每轮重载都会撞上
+            let b64 = await Task.detached(priority: .userInitiated) { () -> String in
+                guard let data = try? Data(contentsOf: zipURL) else { return "" }
+                return data.base64EncodedString()
+            }.value
+            AppLog.log("[Pyodide] seedPersistMirror 启动 b64len=%{public}lu", log: Log.pyodide, UInt(b64.count))
             // 等 host.js 设出等待标志（页面 JS 环境就绪）；每次 probe 最多
             // 1s（超时竞速），60 次为预算上限，页面始终未就绪则放弃注入。
             // epoch 绑定：探针读到「与上次已知值不同的新戳」才认定本页就绪，
@@ -529,6 +533,14 @@ public final class PyodideBridge: NSObject, ObservableObject {
         var injected = 0
         var idx = payload.startIndex
         while idx < payload.endIndex {
+            // 注入途中进程死亡/重载（review P1-1）：残块会写进重生后新页的
+            // window.__MS_WS_B64__，污染下轮注入的长度校验；即刻中止并清空
+            guard isReady else {
+                _ = await evaluate("window.__MS_WS_B64__ = null; 'ok'")
+                AppLog.log("[Pyodide] 快照注入中止（运行时已重置，已注入 %{public}ld 块）",
+                       log: Log.pyodide, Int32(injected))
+                return ""
+            }
             let end = payload.index(idx, offsetBy: 1_000_000, limitedBy: payload.endIndex) ?? payload.endIndex
             let chunk = String(payload[idx..<end])
             let op = injected == 0 ? "=" : "+="
@@ -662,6 +674,16 @@ public final class PyodideBridge: NSObject, ObservableObject {
         }
         let id = UUID().uuidString
         await seedWorkspaceMirror() // I-4：Documents 快照注入（指纹一致时零开销跳过）
+        // seed 途中进程死亡兜底（review P1-1）：jetsam 最高发窗口恰是快照
+        // 注入本身，此刻本调用尚未进 pendingRun，死亡回调够不到它。若放行，
+        // park 后的 evaluate 落在进程重生/未 commit 窗口时 completionHandler
+        // 可能永不回调（见 evaluate 处实测注释），无 timeout 的便捷重载
+        // 将永久挂死
+        guard isReady else {
+            return PyodideRunResult(stdout: "", stderr: "",
+                                    exception: Self.terminatedMessage,
+                                    exitCode: -1, durationMs: 0)
+        }
         if let onOutput { outputHandlers[id] = onOutput }
         ensureWebAttached() // window 就绪晚于 bridge 初始化的场景兜底
         return await withCheckedContinuation { (cont: CheckedContinuation<PyodideRunResult, Never>) in
@@ -701,19 +723,29 @@ public final class PyodideBridge: NSObject, ObservableObject {
     ///
     /// 恢复动作与 scheduleTimeout 一致：fail 全部 pending + 重载宿主页
     /// （官方文档推荐的重载时机，重生进程 + 重新 bootstrap + 重新 ready）。
+    /// 退避（review P2-2）：60s 窗口内 ≥3 次死亡视为持续内存压力——重载
+    /// 会立刻主线程读 zip + 重新注入，再撞限即 death loop，故停止自动
+    /// 重载，置 loadError 让后续调用显式失败、由用户重启 App 恢复。
+    private static let terminatedMessage =
+        "Pyodide 进程因内存压力被系统回收，运行时已自动重置，请重试"
+    private var terminationTimes: [Date] = []
+
     fileprivate func handleWebContentTerminated() {
-        let msg = "Pyodide 进程因内存压力被系统回收，运行时已自动重置，请重试"
-        AppLog.log("[Pyodide] WebContent 进程死亡，fail pending run=%{public}ld install=%{public}ld uninstall=%{public}ld list=%{public}ld clear=%{public}ld 并重载",
+        let now = Date()
+        terminationTimes.append(now)
+        terminationTimes = terminationTimes.filter { now.timeIntervalSince($0) < 60 }
+        let shouldReload = terminationTimes.count < 3
+        AppLog.log("[Pyodide] WebContent 进程死亡，fail pending run=%{public}ld install=%{public}ld uninstall=%{public}ld list=%{public}ld clear=%{public}ld",
                    log: Log.pyodide, type: .error,
                    pendingRun.count, pendingInstall.count, pendingUninstall.count,
                    pendingList.count, pendingClear.count)
         for cont in pendingRun.values {
             cont.resume(returning: PyodideRunResult(
-                stdout: "", stderr: "", exception: msg, exitCode: -1, durationMs: 0))
+                stdout: "", stderr: "", exception: Self.terminatedMessage, exitCode: -1, durationMs: 0))
         }
         pendingRun.removeAll()
         for cont in pendingInstall.values {
-            cont.resume(returning: PyodideInstallResult(ok: false, version: nil, error: msg))
+            cont.resume(returning: PyodideInstallResult(ok: false, version: nil, error: Self.terminatedMessage))
         }
         pendingInstall.removeAll()
         for cont in pendingUninstall.values { cont.resume(returning: false) }
@@ -725,7 +757,13 @@ public final class PyodideBridge: NSObject, ObservableObject {
         outputHandlers.removeAll()
         installProgressHandlers.removeAll()
         isReady = false
-        loadHostPage()
+        if shouldReload {
+            loadHostPage()
+        } else {
+            loadError = "Pyodide 运行时短时间内反复崩溃（内存压力），已停止自动恢复；请重启 App 后重试"
+            AppLog.log("[Pyodide] 60s 内第 %{public}ld 次进程死亡，停止自动重载（防 death loop）",
+                   log: Log.pyodide, type: .error, Int32(terminationTimes.count))
+        }
     }
 
     // MARK: Install / uninstall
@@ -952,10 +990,15 @@ private final class NavigationDelegate: NSObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView,
                  didFail navigation: WKNavigation!,
                  withError error: Error) {
-        // 宿主页自身加载失败：仅记录（bootstrap 超时兜底会再重载）
+        let nsError = error as NSError
+        // 双载竞态（超时兜底与死亡兜底先后 load）：第二次 load 会以 -999
+        // 取消在途导航——竞态信号而非加载失败，记 ERROR 会干扰 jetsam 排查
+        guard nsError.code != NSURLErrorCancelled else { return }
+        // 宿主页自身加载失败：仅记录（readyContinuations 由下一次死亡/
+        // 超时兜底恢复；Swift 侧没有 bootstrap 超时重载）
         Task { @MainActor in
             AppLog.log("[Pyodide] 宿主页加载失败: %{public}@", log: Log.pyodide, type: .error,
-                       (error as NSError).localizedDescription)
+                       nsError.localizedDescription)
         }
     }
 
