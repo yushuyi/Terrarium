@@ -50,6 +50,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
 
     private var webView: WKWebView!
     private var messageHandler: MessageHandler!
+    /// WebContent 进程死亡回调 shim（jetsam 杀进程后 pending 调用 fail-fast 的关键）
+    private var navigationShim: NavigationDelegate!
 
     /// Per-call continuation map. Each `runPython`/`installPackage`/etc.
     /// generates a UUID, parks its continuation here, and the JS host
@@ -99,6 +101,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
         config.defaultWebpagePreferences = prefs
 
         webView = WKWebView(frame: CGRect(x: -1, y: -1, width: 1, height: 1), configuration: config)
+        // WebContent 进程死亡回调（jetsam 兜底，见 handleWebContentTerminated）
+        navigationShim = NavigationDelegate(owner: self)
+        webView.navigationDelegate = navigationShim
         // 必须挂到 window：WebKit 对不属于可见窗口的 WebContent 进程只持
         // 后台级断言，iOS 会随时冻结该进程（JS 一进异步等待就冻），
         // 表现为 runResult 永不返回。1x1 + 近零 alpha + 禁触摸，用户不可见。
@@ -395,6 +400,14 @@ public final class PyodideBridge: NSObject, ObservableObject {
     ]
     private nonisolated static let wsExcludedFiles: Set<String> = [
         "pyodide_persist.zip", "MCPServers.json",
+        // App 自身数据库与调试日志（fps-check/perf-check/prio/replay/
+        // typewriter 等性能工具写在 Documents 根）：pyodide 工作区无读取
+        // 场景，合计 ~12MB 白白抬高铁护栏边缘的注入峰值——WebContent
+        // jetsam（per-process-limit）的元凶之一，注入 b64 在 JS 侧是
+        // UTF-16 字符串，内存翻倍
+        "sessions.db", "sessions.db-wal", "sessions.db-shm",
+        "prio.log", "fps-check.log", "fps-check2.log",
+        "perf-check.log", "replay-debug.log", "typewriter-perf.log",
     ]
 
     /// 上次注入的 Documents 指纹（相对路径|大小|mtime 稳定排序拼接）。
@@ -678,6 +691,43 @@ public final class PyodideBridge: NSObject, ObservableObject {
         }
     }
 
+    /// WebContent 进程死亡兜底（jetsam per-process-limit / 系统回收）。
+    ///
+    /// 实测场景（2026-09-21）：42MB 工作区快照注入把 WebContent 顶过
+    /// per-process-limit 被 jetsam 杀掉（domain:jetsam code:per-process-limit），
+    /// WebKit 自动重生进程但 JS 上下文全丢——所有 pending 调用的回调
+    /// 永不到达，Swift 侧 continuation 永不 resume → 终端串行闸门被
+    /// 永久占死（「终端正忙」），30 分钟超时兜底前整个命令管线不可用。
+    ///
+    /// 恢复动作与 scheduleTimeout 一致：fail 全部 pending + 重载宿主页
+    /// （官方文档推荐的重载时机，重生进程 + 重新 bootstrap + 重新 ready）。
+    fileprivate func handleWebContentTerminated() {
+        let msg = "Pyodide 进程因内存压力被系统回收，运行时已自动重置，请重试"
+        AppLog.log("[Pyodide] WebContent 进程死亡，fail pending run=%{public}ld install=%{public}ld uninstall=%{public}ld list=%{public}ld clear=%{public}ld 并重载",
+                   log: Log.pyodide, type: .error,
+                   pendingRun.count, pendingInstall.count, pendingUninstall.count,
+                   pendingList.count, pendingClear.count)
+        for cont in pendingRun.values {
+            cont.resume(returning: PyodideRunResult(
+                stdout: "", stderr: "", exception: msg, exitCode: -1, durationMs: 0))
+        }
+        pendingRun.removeAll()
+        for cont in pendingInstall.values {
+            cont.resume(returning: PyodideInstallResult(ok: false, version: nil, error: msg))
+        }
+        pendingInstall.removeAll()
+        for cont in pendingUninstall.values { cont.resume(returning: false) }
+        pendingUninstall.removeAll()
+        for cont in pendingList.values { cont.resume(returning: []) }
+        pendingList.removeAll()
+        for cont in pendingClear.values { cont.resume(returning: false) }
+        pendingClear.removeAll()
+        outputHandlers.removeAll()
+        installProgressHandlers.removeAll()
+        isReady = false
+        loadHostPage()
+    }
+
     // MARK: Install / uninstall
 
     /// Install `pkg` via micropip. Progress lines stream via `onProgress`
@@ -888,6 +938,30 @@ private final class MessageHandler: NSObject, WKScriptMessageHandler {
         guard let body = message.body as? [String: Any] else { return }
         Task { @MainActor [weak owner] in
             owner?.handleMessage(body)
+        }
+    }
+}
+
+// MARK: - WKNavigationDelegate shim
+//
+// 与 MessageHandler 同款：协议回调在非主 actor，弹回主 actor 再处理。
+private final class NavigationDelegate: NSObject, WKNavigationDelegate {
+    weak var owner: PyodideBridge?
+    init(owner: PyodideBridge) { self.owner = owner }
+
+    func webView(_ webView: WKWebView,
+                 didFail navigation: WKNavigation!,
+                 withError error: Error) {
+        // 宿主页自身加载失败：仅记录（bootstrap 超时兜底会再重载）
+        Task { @MainActor in
+            AppLog.log("[Pyodide] 宿主页加载失败: %{public}@", log: Log.pyodide, type: .error,
+                       (error as NSError).localizedDescription)
+        }
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        Task { @MainActor [weak owner] in
+            owner?.handleWebContentTerminated()
         }
     }
 }
