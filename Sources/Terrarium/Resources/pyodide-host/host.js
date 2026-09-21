@@ -527,7 +527,9 @@ async function runPython(id, code) {
       ]);
       const modName = missing ? missing[2] : null;
       const rootName = modName ? modName.split(".")[0] : null;
-      if (!modName || missing[1] || STDLIB_SKIP.has(rootName)) throw firstErr;
+      // rootName 与 modName 都查表：子模块（google.protobuf → root=google
+      // 不在表内但 modName 命中 test 之类）同样拦下（审查 P2-1）
+      if (!modName || missing[1] || STDLIB_SKIP.has(rootName) || STDLIB_SKIP.has(modName)) throw firstErr;
       if (currentRunId !== null) {
         post({ kind: "stderr", id: currentRunId,
                line: `[pyodide] 缺少 ${modName}，自动安装后重跑…` });
@@ -567,8 +569,11 @@ if _n:
         try { await pyodide.runPythonAsync("globals().get('_ms_saved_figs', set()).clear()"); } catch (_) {}
         await runUser();
       } catch (retryErr) {
-        // 自动安装失败或重跑仍失败：呈现第二次的真实错误（更接近根因）
-        exception = String(retryErr && retryErr.message || retryErr);
+        // 自动安装失败或重跑仍失败：双写保留两个错误——原始 MNFE 告诉
+        // 用户缺什么，retry 错误说明为什么没装上（网络断/包名不存在），
+        // 单看任何一个都可能误导（审查 P2-2）
+        exception = firstMsg + "\n[pyodide] 自动安装/重跑失败: " +
+                    String(retryErr && retryErr.message || retryErr);
         exitCode = 1;
       }
     }
