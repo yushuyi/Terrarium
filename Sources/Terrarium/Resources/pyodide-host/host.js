@@ -195,6 +195,22 @@ if "${sitePackages}" not in sys.path:
       console.warn("[mianshu_http] 注入失败:", e);
     }
 
+    // mianshu_pkg：用户脚本内安装 PyPI 包并自动持久化（顶层 await 配套）。
+    // 裸 micropip.install 不输出镜像 marker、冷启动丢包；本模块复刻 pip
+    // 通道的镜像逻辑。只需落盘 purelib 供 import，无 install 动作。
+    try {
+      const pkgResp = await fetch("pyodide-local://host/mianshu_pkg.py");
+      if (!pkgResp.ok) throw new Error("fetch 失败: " + pkgResp.status);
+      const pkgText = await pkgResp.text();
+      const siteDirPkg = pyodide.runPython(
+        "import sysconfig; sysconfig.get_paths()['purelib']"
+      );
+      pyodide.FS.writeFile(siteDirPkg + "/mianshu_pkg.py", pkgText, { encoding: "utf8" });
+    } catch (e) {
+      bootWarnings.push("mianshu_pkg 注入失败，脚本内 install_packages 不可用: " + String(e && e.message || e));
+      console.warn("[mianshu_pkg] 注入失败:", e);
+    }
+
     // 运行时环境统一：HOME 固化为容器根（与原生 CPython 的
     // PythonBridge.m setenv 对齐）。pyodide 默认 HOME=/home/pyodide
     // 是 MEMFS 虚拟路径，`~` 展开跨运行时漂移（测试计划 I-3）。
