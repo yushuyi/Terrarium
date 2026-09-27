@@ -385,7 +385,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
     private nonisolated static let wsMaxFileCount = 2000
     /// 单文件上限：大二进制（数据库/媒体）不进快照，避免注入与收集
     /// 载荷把同步 XHR/postMessage 通道拖垮（首版全量打包曾卡死 App）
-    private nonisolated static let wsMaxFileBytes = 8 * 1024 * 1024
+    nonisolated static let wsMaxFileBytes = 8 * 1024 * 1024
     /// 快照排除：App 私有数据目录与运行时通道文件。persist zip 走专用
     /// 镜像通道；其余是聊天/记忆/收件箱等 App 自管数据，不参与 pyodide
     /// 工作区。快照只覆盖用户工作产物（tests/、pyodide_figures/、tmp/
@@ -447,10 +447,19 @@ public final class PyodideBridge: NSObject, ObservableObject {
         Self.wsIncludedImpl(rel, fileSize: fileSize)
     }
 
-    private nonisolated static func wsIncludedImpl(_ rel: String, fileSize: Int) -> Bool {
-        if wsExcludedFiles.contains(rel) || wsExcludedPrefixes.contains(where: { rel.hasPrefix($0) }) {
-            return false
-        }
+    /// internal 仅为单测可及（@testable）：PyodideBridgeSnapshotFilterTests
+    ///
+    /// 目录排除按**路径段**匹配（对任意深度生效）：node_modules 等包目录可
+    /// 出现在用户项目子目录（如 tmp/<proj>/node_modules/），裸 hasPrefix
+    /// 只能命中根级、嵌套的会整树漏进快照重新抬升注入体积（过滤器单测
+    /// 发现）。前缀表统一 "dir/" 形态：剥尾斜杠后与「目录部分」逐段精确
+    /// 比较——既不放走嵌套，也不误杀共享前缀名（backups-archive/ 等）；
+    /// 末段是文件名不参与目录匹配（根级同名文件保持放行，与旧语义一致）。
+    nonisolated static func wsIncludedImpl(_ rel: String, fileSize: Int) -> Bool {
+        if wsExcludedFiles.contains(rel) { return false }
+        let dirNames = Set(wsExcludedPrefixes.map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 })
+        let comps = rel.split(separator: "/").map(String.init)
+        if comps.dropLast().contains(where: dirNames.contains) { return false }
         return fileSize <= wsMaxFileBytes
     }
 
