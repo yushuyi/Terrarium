@@ -410,6 +410,12 @@ public final class PyodideBridge: NSObject, ObservableObject {
         // 隔离态（I-4 用例 Errno 44 的根因）；且原生 3.14 的包源码不应进入
         // pyodide 3.13 的文件视图，pyodide 包体系走 persist zip 专用通道
         ".python/",
+        // 推送到真机的仓库检出（MianShu 源码/测试/SPM checkout，真机实测
+        // 7380 文件、占 Documents 文件数 80%）：同样撑爆 >2000 文件护栏
+        // 导致整包跳过（2026-09-29 读 PDF 双会话失败现场，MEMFS 全空、
+        // 附件与技能本地模块 _mdenv/entry_utils 均不可见）。原生侧直接读
+        // 磁盘，pyodide 无读取场景
+        "mianshu/","Mianshu/",
     ]
     private nonisolated static let wsExcludedFiles: Set<String> = [
         "pyodide_persist.zip", "MCPServers.json",
