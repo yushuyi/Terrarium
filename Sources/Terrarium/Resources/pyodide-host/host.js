@@ -347,7 +347,14 @@ async function runPython(id, code) {
           );
           for (const line of meta.split("\n")) {
             if (!line.startsWith("Requires-Dist:")) continue;
-            const dep = line.slice(14).trim().split(/[ ;<>=!\[]/)[0];
+            const spec = line.slice(14).trim();
+            // extras（extra == 'crypto' 等）不预载：pip 语义里可选依赖
+            // 不随主包安装（真机实测 pypdf 的 cryptography extra 每跑
+            // 必报 Load failed，纯噪声）
+            if (/;\s*extra\b/.test(spec)) continue;
+            // 分隔符补 ~：'pkg~=1.2' 兼容版本声明此前被整段截成 'pkg~'
+            // 去 loadPackage 查无此包（真机现场 'magika~'/'mammoth~' 根因）
+            const dep = spec.split(/[ ;<>=!~\[\]]/)[0];
             if (dep) persistDeps.add(dep.toLowerCase().replace(/_/g, "-"));
           }
         } catch (_) {}
@@ -385,10 +392,16 @@ async function runPython(id, code) {
         }
       }
       if (pkgLoadErrors.size && currentRunId) {
+        // 收敛刷屏：逐包错误只留前 200 字符 + 计数（2026-09-29 现场
+        // 17 项连排 ~4KB stderr 墙，每条 python 命令都污染 LLM 上下文）
+        const items = [...pkgLoadErrors].join(" | ");
+        const brief = items.length > 200
+          ? items.slice(0, 200) + " … 共 " + pkgLoadErrors.size + " 项"
+          : items;
         post({
           kind: "stderr",
           id: currentRunId,
-          line: "[pyodide] lockfile 依赖 loadPackage 失败: " + [...pkgLoadErrors].join(" | "),
+          line: "[pyodide] lockfile 依赖 loadPackage 失败: " + brief,
         });
       }
     } catch (persistErr) {
@@ -546,18 +559,23 @@ async function runPython(id, code) {
       // rootName 与 modName 都查表：子模块（google.protobuf → root=google
       // 不在表内但 modName 命中 test 之类）同样拦下（审查 P2-1）
       if (!modName || missing[1] || STDLIB_SKIP.has(rootName) || STDLIB_SKIP.has(modName)) throw firstErr;
+      // PEP 508 包名预校验：本地模块（_mdenv 等下划线名）不是合法 PyPI
+      // 包名，micropip 必抛 InvalidRequirement（2026-09-29 turn_5 现场
+      // 的全 traceback 刷屏根因）；普通本地名也会白撞一次 PyPI 404。
+      // 校验不过直接回抛原始 MNFE——真实错误即用户所需
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(modName)) throw firstErr;
       if (currentRunId !== null) {
         post({ kind: "stderr", id: currentRunId,
                line: `[pyodide] 缺少 ${modName}，自动安装后重跑…` });
       }
       try {
         await pyodide.loadPackage("micropip", { messageCallback: () => {}, errorCallback: () => {} });
+        // 直接 await（与下方 FALLBACK PATH 同模式）：不经 ensure_future
+        // 任务——任务内异常会触发 asyncio "Unhandled exception in event
+        // loop" 全 traceback 刷屏（2026-09-29 现场第二噪声源）
         await pyodide.runPythonAsync(
-          `import micropip as _ms_mip, asyncio as _ms_aio
-_ms_t = _ms_aio.ensure_future(_ms_mip.install([${JSON.stringify(modName)}]))
-while not _ms_t.done():
-    await _ms_aio.sleep(0.05)
-_ms_t.result()`
+          `import micropip as _ms_mip
+await _ms_mip.install([${JSON.stringify(modName)}])`
         );
         // persist 落盘：与终端 pip 壳同款 zip 镜像（经 stdout 标记行回传
         // Swift storePersistMirror），否则装完重启即丢
@@ -586,10 +604,11 @@ if _n:
         await runUser();
       } catch (retryErr) {
         // 自动安装失败或重跑仍失败：双写保留两个错误——原始 MNFE 告诉
-        // 用户缺什么，retry 错误说明为什么没装上（网络断/包名不存在），
-        // 单看任何一个都可能误导（审查 P2-2）
-        exception = firstMsg + "\n[pyodide] 自动安装/重跑失败: " +
-                    String(retryErr && retryErr.message || retryErr);
+        // 用户缺什么，retry 错误截末行说明为什么没装上（网络断/包名不
+        // 存在），完整 traceback 会淹没原错误（审查 P2-2 意图不变）
+        const retryFull = String(retryErr && retryErr.message || retryErr);
+        const retryLine = retryFull.trim().split("\n").filter(l => l.trim()).pop() || retryFull;
+        exception = firstMsg + "\n[pyodide] 自动安装/重跑失败: " + retryLine;
         exitCode = 1;
       }
     }
