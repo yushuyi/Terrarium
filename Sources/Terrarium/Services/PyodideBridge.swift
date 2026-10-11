@@ -563,12 +563,17 @@ public final class PyodideBridge: NSObject, ObservableObject {
         guard let fingerprint = documentsFingerprint() else {
             AppLog.log("[Pyodide] 工作区快照跳过：Documents 超护栏（>32MB 或 >2000 文件）",
                    log: Log.pyodide)
+            // 跳过≠可疑：host.js 据此走「白纸 + 收集回写」降级通道而非熔断
+            _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
             return ""
         }
         let packed = await Task.detached(priority: .userInitiated) {
             Self.packSnapshotEntries()
         }.value
-        guard let (entries, payload) = packed else { return "" }
+        guard let (entries, payload) = packed else {
+            _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
+            return ""
+        }
         var injected = 0
         var idx = payload.startIndex
         while idx < payload.endIndex {
@@ -598,6 +603,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
         }
         wsLastFingerprint = fingerprint
         wsInjectedIntoCurrentPage = true
+        // 注入成功即清除跳过标记：同页后续 run 的告警语义回到 ready 口径
+        _ = await evaluate("window.__MS_WS_SKIPPED__ = false; 'ok'")
         AppLog.log("[Pyodide] 工作区快照注入完成 文件数=%{public}ld payload=%{public}ld 字节",
                log: Log.pyodide, Int32(entries.count), Int32(payload.utf8.count))
         return ""

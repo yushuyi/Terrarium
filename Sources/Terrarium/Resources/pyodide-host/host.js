@@ -260,7 +260,7 @@ if "${sitePackages}" not in sys.path:
           "    except Exception:\n" +
           "        _p = ''\n" +
           "    _mode = a[0] if a else 'r'\n" +
-          "    _ws_ready = bool(getattr(__import__('js').window, '__MS_WS_READY__', False))\n" +
+          "    _ws_ready = bool(getattr(__import__('js').window, '__MS_WS_READY__', False)) or bool(getattr(__import__('js').window, '__MS_WS_SKIPPED__', False))\n" +
           "    _in_docs = _p.startswith(" + docRootLit + " + '/Documents/')\n" +
           "    if isinstance(_p, str) and isinstance(_mode, str) and _p.startswith(" + docRootLit + ") and any(c in _mode for c in 'wax+') and (not _in_docs or not _ws_ready) and not getattr(_msb, '_ms_mem_warned', False):\n" +
           "        _msb._ms_mem_warned = True\n" +
@@ -513,6 +513,15 @@ async function runPython(id, code) {
         }
         window.__MS_WS_READY__ = true;
       } catch (e) { console.warn("[pyodide] 工作区恢复失败:", e); }
+    } else if (window.__MS_DOCROOT__ && window.__MS_WS_SKIPPED__) {
+      // 跳过≠可疑（2026-10-11 超护栏事故收尾）：护栏主动跳过注入时，
+      // Documents 写入通道降级为「MEMFS 白纸 + 轮末收集回写」而非熔断——
+      // 目录建起来防 ENOENT（boot 期 chdir/symlink 已执行，缺的只是子树）；
+      // 清空清单基线防 WS_COLLECT 把历史清单全部误报为「已删除」批量回删宿主
+      try { pyodide.FS.mkdirTree(window.__MS_DOCROOT__ + "/Documents/tmp"); }
+      catch (e) { console.warn("[pyodide] 跳过态 Documents 目录重建失败:", e); }
+      try { pyodide.FS.writeFile("/persist/.ms_ws_manifest.json", "{}"); }
+      catch (e) { console.warn("[pyodide] 跳过态清单基线重置失败:", e); }
     }
     await loadFromLockfile();
     // urllib3 在用户 import 时会被再次注入 emscripten 连接类，执行前还原
