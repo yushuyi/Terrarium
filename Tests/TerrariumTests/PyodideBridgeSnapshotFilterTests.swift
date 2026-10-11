@@ -95,6 +95,49 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
         XCTAssertFalse(PyodideBridge.wsIncludedImpl("sessions.db", fileSize: 10))
     }
 
+    // MARK: - 2026-10-11 超护栏现场排查新增规则
+
+    /// .git 目录整树排除：Documents/.git 是 App 自动提交仓库（881 松散对象
+    /// 只增不减），included 集字节破 32MB 护栏推手之一
+    func testExcluded_gitDir_atRootAndNested() {
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl(".git/objects/00/1f29bdcfe5", fileSize: 10))
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl(".git/index", fileSize: 10))
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("myproj/.git/HEAD", fileSize: 10),
+                       "用户项目内嵌套 .git 同样按目录段排除")
+    }
+
+    /// .git 排除不得误杀同名前缀文件
+    func testExcluded_gitDir_noFalsePositive() {
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl(".gitignore", fileSize: 10),
+                      ".gitignore 是普通文件，不得被 .git/ 目录排除牵连")
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl(".gitattributes", fileSize: 10))
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl("myproj/.github/workflows/ci.yml", fileSize: 10),
+                      ".github/ 目录不受 .git/ 排除影响")
+    }
+
+    /// .log 后缀全深度排除：diag-*.log（13.4MB）/applog-*.log 是 included 集
+    /// 字节破 32MB 护栏的主力；此前精确名单追着文件名跑，改为规则
+    func testExcluded_logSuffix_anyDepth() {
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("diag-base-fix.log", fileSize: 4_905_818))
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("applog-20261001.log", fileSize: 943_734))
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("tmp/run.log", fileSize: 10),
+                       ".log 后缀在子目录同样生效")
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("TRACE.LOG", fileSize: 10),
+                       "后缀匹配大小写不敏感")
+    }
+
+    /// .log 后缀规则的边界：非 .log 后缀、用户数据不受牵连
+    func testExcluded_logSuffix_noFalsePositive() {
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl("rec_20261010-203115-1yav.zip", fileSize: 416_608),
+                      "会话录制 zip 是用户数据，保持注入（超护栏排查结论：不随日志一并排除）")
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl("catalog.logx", fileSize: 10),
+                      "仅 .log 结尾才排除，.logx 是普通文件")
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl("logs/notes.txt", fileSize: 10),
+                      "logs/ 目录本身不在排除规则（规则按文件后缀，不按目录名）")
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl("高性价比人生指南.epub", fileSize: 1_001_049),
+                      "用户内容保持注入")
+    }
+
     /// 空串/奇怪输入不崩、语义明确
     func testEdgeCases_dontCrash() {
         // 空路径无前缀命中，按大小放行

@@ -416,18 +416,28 @@ public final class PyodideBridge: NSObject, ObservableObject {
         // 附件与技能本地模块 _mdenv/entry_utils 均不可见）。原生侧直接读
         // 磁盘，pyodide 无读取场景
         "mianshu/","Mianshu/",
+        // git 元数据（2026-10-11 超护栏现场排查）：Documents/.git 是 App 侧
+        // 自动提交仓库（每建一个文件即 commit、无 packfile 全松散对象），
+        // 实测 881 个对象且只增不减——对象内容是 diag/rec/epub 等文件的
+        // zlib 历史拷贝，included 集字节破 32MB 护栏的推手之一。pyodide
+        // 无读取场景（git 走原生通道）；按目录段匹配，用户项目内嵌套
+        // .git 一并生效，.gitignore/.gitattributes 等同名前缀文件不受牵连
+        ".git/",
     ]
     private nonisolated static let wsExcludedFiles: Set<String> = [
         "pyodide_persist.zip", "MCPServers.json",
-        // App 自身数据库与调试日志（fps-check/perf-check/prio/replay/
-        // typewriter 等性能工具写在 Documents 根）：pyodide 工作区无读取
-        // 场景，合计 ~12MB 白白抬高铁护栏边缘的注入峰值——WebContent
-        // jetsam（per-process-limit）的元凶之一，注入 b64 在 JS 侧是
-        // UTF-16 字符串，内存翻倍
+        // App 自身数据库（SQLite + WAL/SHM，~3MB+）：原生侧高频读写，
+        // pyodide 工作区无读取场景
         "sessions.db", "sessions.db-wal", "sessions.db-shm",
-        "prio.log", "fps-check.log", "fps-check2.log",
-        "perf-check.log", "replay-debug.log", "typewriter-perf.log",
     ]
+    /// 排除文件后缀（2026-10-11 超护栏现场排查新增）：运行时日志
+    /// （diag-*.log 13.4MB、applog-*.log 1.2MB、prio/perf/fps 等）在
+    /// Documents 根持续累积，是本次 included 集字节破 32MB 护栏的主力。
+    /// 按末段后缀匹配（大小写不敏感）、任意深度生效；此前精确名单
+    /// （prio/fps/perf/replay/typewriter）追着新日志文件名跑，改为规则。
+    /// pyodide 对日志无读取场景；用户数据（rec_*.zip/epub/文档）不在
+    /// 此列、保持注入
+    private nonisolated static let wsExcludedFileSuffixes: Set<String> = [".log"]
 
     /// 上次注入的 Documents 指纹（相对路径|大小|mtime 稳定排序拼接）。
     /// 收集写回后更新——宿主与 MEMFS 一致期间跳过重复注入。
@@ -463,8 +473,13 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 末段是文件名不参与目录匹配（根级同名文件保持放行，与旧语义一致）。
     nonisolated static func wsIncludedImpl(_ rel: String, fileSize: Int) -> Bool {
         if wsExcludedFiles.contains(rel) { return false }
-        let dirNames = Set(wsExcludedPrefixes.map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 })
         let comps = rel.split(separator: "/").map(String.init)
+        // 末段后缀匹配（大小写不敏感）：运行时日志 .log 全深度排除
+        if let last = comps.last,
+           Self.wsExcludedFileSuffixes.contains(where: { last.lowercased().hasSuffix($0) }) {
+            return false
+        }
+        let dirNames = Set(wsExcludedPrefixes.map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 })
         if comps.dropLast().contains(where: dirNames.contains) { return false }
         return fileSize <= wsMaxFileBytes
     }
