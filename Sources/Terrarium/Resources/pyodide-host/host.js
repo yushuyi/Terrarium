@@ -274,6 +274,67 @@ if "${sitePackages}" not in sys.path:
       console.warn("[pyodide] 环境统一注入失败:", e);
     }
 
+    // CJK 字体注入（matplotlib 中文渲染修复）：Noto Serif SC 随 bundle 经
+    // pyodide-local://bundle/ 伺服（字体文件本体在 DesignTokens bundle，
+    // SchemeHandler 跨包 fallback 伺服，与运行时同源，完全离线），落 MEMFS
+    // 固定路径 /ms_fonts/。两个通道分工：
+    // ① matplotlibrc 落 $HOME/.matplotlib/（3.8.4 实测 configdir，非
+    //    ~/.config/matplotlib）——贡献 axes.unicode_minus 与回退链声明。
+    //    注意：绕过 __import__ 钩子的 import 路径（importlib.import_module
+    //    等）rc 也补不了注册（addfont 没跑，fontlist.json 缓存下 rc 引用
+    //    的 family 照样找不到），字体注册以 ② 为准；
+    // ② 首次 import 钩子（builtins.__import__ 包装，__spec__._initializing
+    //    判定 matplotlib 初始化完成后）执行 fontManager.addfont + rcParams
+    //    前置注入——必须走钩子而非只靠 rc：wheel 自带的 fontlist.json
+    //    （构建期生成，无 Noto）会被 _load_fontmanager 读作缓存，首
+    //    import 压根不做目录扫描，rc 引用的 family 找不到。
+    // fetch/写入失败仅告警不熔断：英文图表照常，中文退化为方框（修复前行为）
+    try {
+      const fontResp = await fetch("pyodide-local://bundle/NotoSerifSC-Regular.otf");
+      if (!fontResp.ok) throw new Error("font fetch " + fontResp.status);
+      const fontBytes = new Uint8Array(await fontResp.arrayBuffer());
+      pyodide.FS.mkdirTree("/ms_fonts");
+      pyodide.FS.writeFile("/ms_fonts/NotoSerifSC-Regular.otf", fontBytes);
+      const msHome = window.__MS_DOCROOT__ || "/home/pyodide";
+      pyodide.FS.mkdirTree(msHome + "/.matplotlib");
+      pyodide.FS.writeFile(
+        msHome + "/.matplotlib/matplotlibrc",
+        "font.family: sans-serif\n"
+        + "font.sans-serif: Noto Serif SC, DejaVu Sans, Bitstream Vera Sans, Computer Modern Sans Serif, Lucida Grande, Verdana, Geneva, Lucid, Arial, Helvetica, Avant Garde, sans-serif\n"
+        + "axes.unicode_minus: False\n",
+        { encoding: "utf8" }
+      );
+      await pyodide.runPythonAsync(
+        "import builtins as _msb, sys as _mssys\n" +
+        "_ms_orig_import = _msb.__import__\n" +
+        "def _ms_mpl_font_hook(name, *a, **k):\n" +
+        "    _m = _ms_orig_import(name, *a, **k)\n" +
+        "    try:\n" +
+        "        if name.split('.')[0] == 'matplotlib' and not getattr(_msb, '_ms_mpl_fonted', False):\n" +
+        "            _ms_top = _mssys.modules.get('matplotlib')\n" +
+        "            _ms_init = getattr(getattr(_ms_top, '__spec__', None), '_initializing', _ms_top is None)\n" +
+        "            if not _ms_init:\n" +
+        "                _msb._ms_mpl_fonted = True\n" +
+        "                import os as _msos\n" +
+        "                if _msos.path.exists('/ms_fonts/NotoSerifSC-Regular.otf'):\n" +
+        "                    import matplotlib as _msmpl\n" +
+        "                    from matplotlib import font_manager as _msfm\n" +
+        "                    _msfm.fontManager.addfont('/ms_fonts/NotoSerifSC-Regular.otf')\n" +
+        "                    _ms_ss = list(_msmpl.rcParams['font.sans-serif'])\n" +
+        "                    if 'Noto Serif SC' not in _ms_ss:\n" +
+        "                        _ms_ss.insert(0, 'Noto Serif SC')\n" +
+        "                    _msmpl.rcParams['font.sans-serif'] = _ms_ss\n" +
+        "    except Exception as _msfe:\n" +
+        "        print('WARNING: matplotlib CJK 字体注册失败（中文图表将显示方框）: ' + repr(_msfe), file=_mssys.stderr)\n" +
+        "    return _m\n" +
+        "_msb.__import__ = _ms_mpl_font_hook\n"
+      );
+      console.log("[pyodide] CJK 字体注入完成: NotoSerifSC " + fontBytes.length + "B → /ms_fonts + matplotlibrc + import 钩子");
+    } catch (e) {
+      bootWarnings.push("CJK 字体注入失败（matplotlib 中文将显示方框）: " + String(e && e.message || e));
+      console.warn("[pyodide] CJK 字体注入失败:", e);
+    }
+
     pyodideReady = true;
     post({ kind: "ready", version: pyodide.version });
   } catch (err) {
@@ -904,12 +965,21 @@ except Exception:
 
 # Manual cleanup: scan each site-packages dir for the package's files
 # and remove them. Match by normalized name (PyPI normalizes - and _).
+# 条目分治匹配（review Y1 同款）：low 归一化后不再含 '-'，startswith
+# (target + '-') 恒 False → dist-info 永远漏删。dist-info 条目解析
+# 「名-版本」后归一化比对；其余条目按 '_' 归一精确等值或带点前缀——
+# 不能 startswith(target + '_')，会误删无关包 a-foo 的 dist-info
 for site in search_dirs:
     if not os.path.isdir(site):
         continue
     for entry in os.listdir(site):
-        low = entry.lower().replace("-", "_")
-        if low == target or low.startswith(target + "-"):
+        low = entry.lower()
+        if low.endswith(".dist-info"):
+            hit = low[:-len(".dist-info")].rsplit("-", 1)[0].replace("-", "_") == target
+        else:
+            t = low.replace("-", "_")
+            hit = t == target or t.startswith(target + ".")
+        if hit:
             full = os.path.join(site, entry)
             try:
                 if os.path.isdir(full):

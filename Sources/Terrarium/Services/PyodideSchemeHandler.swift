@@ -108,22 +108,34 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
 
         // 防目录穿越 + 存在性检查
         let fileURL = base.appendingPathComponent(String(relative.dropFirst()))
-        guard fileURL.standardizedFileURL.path.hasPrefix(base.standardizedFileURL.path),
-              FileManager.default.fileExists(atPath: fileURL.path) else {
+        guard fileURL.standardizedFileURL.path.hasPrefix(base.standardizedFileURL.path) else {
             // 404 是离线链路排查的关键线索，务必留日志
+            NSLog("[PyodideSchemeHandler] 404: \(url.absoluteString)")
+            respond(task, status: 404, body: Data("pyodide-local: not found: \(url.lastPathComponent)".utf8))
+            return
+        }
+        // 主目录未命中时查共享资源 fallback（如 CJK 字体，见 designTokensResource）
+        let resolvedURL: URL
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            resolvedURL = fileURL
+        } else if let shared = Self.designTokensResource(fileURL.lastPathComponent) {
+            resolvedURL = shared
+        } else {
             NSLog("[PyodideSchemeHandler] 404: \(url.absoluteString)")
             respond(task, status: 404, body: Data("pyodide-local: not found: \(url.lastPathComponent)".utf8))
             return
         }
 
         do {
-            let data = try Data(contentsOf: fileURL)
+            // 读取用 resolvedURL：fallback 命中时 fileURL 本身不存在
+            // （review 预警修复：原实现此处仍读 fileURL 必抛错 → 500）
+            let data = try Data(contentsOf: resolvedURL)
             let response = HTTPURLResponse(
                 url: url,
                 statusCode: 200,
                 httpVersion: "HTTP/1.1",
                 headerFields: [
-                    "Content-Type": Self.mimeType(for: fileURL.pathExtension),
+                    "Content-Type": Self.mimeType(for: resolvedURL.pathExtension),
                     "Content-Length": "\(data.count)",
                     "Access-Control-Allow-Origin": "*",
                 ]
@@ -342,6 +354,21 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
         }
         // 兜底：SPM 资源目录直接以子目录形式存在于资源 bundle 根
         return Bundle.module.resourceURL?.appendingPathComponent(name, isDirectory: true)
+    }
+
+    /// 共享资源 fallback：DesignTokens（CocoaPods）resource bundle 是 CJK
+    /// 字体的打包属主（resource_bundles key = "DesignTokens" → App 根
+    /// DesignTokens.bundle，DTFont 注册同一份），Terrarium 不再重复打包
+    /// 14.8MB 副本，也避开 fetch-pyodide.sh 重建 pyodide-runtime 目录时
+    /// 误删资源的隐患。仅按文件名查找；macOS 测试环境无该 bundle 返回 nil
+    /// （404 走原路，host.js 字体注入失败仅告警不熔断，CJK 退化方框）。
+    /// Pod↔SPM 跨包管理器无法建依赖，此处按 bundle 名做运行时约定。
+    private static func designTokensResource(_ fileName: String) -> URL? {
+        guard let bundlePath = Bundle.main.path(forResource: "DesignTokens", ofType: "bundle"),
+              let bundle = Bundle(url: URL(fileURLWithPath: bundlePath)) else {
+            return nil
+        }
+        return bundle.url(forResource: fileName, withExtension: nil)
     }
 
     private static func mimeType(for pathExtension: String) -> String {
