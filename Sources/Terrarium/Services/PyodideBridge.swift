@@ -381,8 +381,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
 
     /// 快照护栏：Documents 超过该字节数/文件数则放弃注入（MEMFS 退化为
     /// 隔离态，guard 的内存态警告保持启用，行为与修复前一致）
-    private nonisolated static let wsMaxTotalBytes = 32 * 1024 * 1024
-    private nonisolated static let wsMaxFileCount = 2000
+    /// 公开给宿主 App 的「Pyodide 运行时体检」页直接展示，避免 App 侧抄
+    /// 一份常量、改阈值时两边漂移
+    public nonisolated static let wsMaxTotalBytes = 32 * 1024 * 1024
+    public nonisolated static let wsMaxFileCount = 2000
     /// 单文件上限：大二进制（数据库/媒体）不进快照，避免注入与收集
     /// 载荷把同步 XHR/postMessage 通道拖垮（首版全量打包曾卡死 App）
     nonisolated static let wsMaxFileBytes = 8 * 1024 * 1024
@@ -444,11 +446,23 @@ public final class PyodideBridge: NSObject, ObservableObject {
     private var wsLastFingerprint: String?
     /// 当前页面已注入标志（页面重载后 JS 变量清空，须与指纹双重判断）
     private var wsInjectedIntoCurrentPage = false
+    /// 最近一次注入记录（仅进程内，供 DEBUG「Pyodide 运行时体检」页展示）
+    private var wsLastInjectionAt: Date?
+    private var wsLastInjectionFileCount = 0
+    private var wsLastInjectionPayloadBytes = 0
+    /// 最近一次 seed 走了哪条分支：跳过 / 超护栏退化 / 正常注入
+    private var wsLastSeedSkipped = false
+    private var wsLastSeedOverGuard = false
 
     /// 显式前缀剥离取相对 Documents 路径。此前 dropFirst(count+1) 隐式
     /// 计算在真机上多剥 2 字符（'Documents'→'cuments'），排除前缀失效、
     /// restore 错位写入——改为 hasPrefix 匹配，不匹配返回 nil 由调用方跳过
     private func wsRelativePath(_ url: URL, docs: URL) -> String? {
+        Self.wsRelativePathImpl(url, docs: docs)
+    }
+
+    /// static 形态供体检页的目录统计 walker 复用（实例方法受主 actor 隔离）
+    nonisolated static func wsRelativePathImpl(_ url: URL, docs: URL) -> String? {
         // standardizedFileURL 统一双方：真机 enumerator 会给出
         // /private/var/... 形态而 documentDirectory 是 /var/...，
         // 不归一化则前缀永不匹配 → 指纹恒空串 → 恒"一致"跳过注入
@@ -558,11 +572,14 @@ public final class PyodideBridge: NSObject, ObservableObject {
         if wsInjectedIntoCurrentPage,
            let fp = wsLastFingerprint,
            fp == documentsFingerprint() {
+            recordSeed(at: Date(), fileCount: wsLastInjectionFileCount, payloadBytes: wsLastInjectionPayloadBytes,
+                       skipped: true, overGuard: false)
             return "" // MEMFS 与宿主一致，零开销跳过
         }
         guard let fingerprint = documentsFingerprint() else {
             AppLog.log("[Pyodide] 工作区快照跳过：Documents 超护栏（>32MB 或 >2000 文件）",
                    log: Log.pyodide)
+            recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, skipped: true, overGuard: true)
             // 跳过≠可疑：host.js 据此走「白纸 + 收集回写」降级通道而非熔断
             _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
             return ""
@@ -571,6 +588,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
             Self.packSnapshotEntries()
         }.value
         guard let (entries, payload) = packed else {
+            recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, skipped: true, overGuard: true)
             _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
             return ""
         }
@@ -603,11 +621,115 @@ public final class PyodideBridge: NSObject, ObservableObject {
         }
         wsLastFingerprint = fingerprint
         wsInjectedIntoCurrentPage = true
+        recordSeed(at: Date(), fileCount: entries.count, payloadBytes: payload.utf8.count,
+                   skipped: false, overGuard: false)
         // 注入成功即清除跳过标记：同页后续 run 的告警语义回到 ready 口径
         _ = await evaluate("window.__MS_WS_SKIPPED__ = false; 'ok'")
         AppLog.log("[Pyodide] 工作区快照注入完成 文件数=%{public}ld payload=%{public}ld 字节",
                log: Log.pyodide, Int32(entries.count), Int32(payload.utf8.count))
         return ""
+    }
+
+    /// 记录最近一次 seed 分支（体检页数据源，不参与注入决策）
+    private func recordSeed(at date: Date, fileCount: Int, payloadBytes: Int, skipped: Bool, overGuard: Bool) {
+        wsLastInjectionAt = date
+        wsLastInjectionFileCount = fileCount
+        wsLastInjectionPayloadBytes = payloadBytes
+        wsLastSeedSkipped = skipped
+        wsLastSeedOverGuard = overGuard
+    }
+
+    // MARK: - 工作区快照体检（DEBUG「Pyodide 运行时体检」页数据源）
+
+    /// Documents 顶层条目占用统计。按「路径第一段」聚合：目录给出整树体积，
+    /// 根目录散文件各自一行。included* 只算真正进快照的部分——两者差值
+    /// 就是排除规则挡掉的体积，是判断「搬家成本还能涨多少」的直接依据。
+    nonisolated static func workspaceFolderStats()
+        -> (folders: [WorkspaceFolderStat], includedFileCount: Int, includedBytes: Int64)
+    {
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        guard let enumerator = fm.enumerator(
+            at: docs,
+            includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]
+        ) else {
+            return ([], 0, 0)
+        }
+        struct Bucket {
+            var isDir = false
+            var fileCount = 0
+            var excludedFileCount = 0
+            var sizeBytes: Int64 = 0
+            var includedBytes: Int64 = 0
+        }
+        var buckets: [String: Bucket] = [:]
+        var includedCount = 0
+        var includedTotal: Int64 = 0
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true else { continue }
+            guard let rel = wsRelativePathImpl(url, docs: docs) else { continue }
+            let size = Int64(values.fileSize ?? 0)
+            let comps = rel.split(separator: "/").map(String.init)
+            guard let top = comps.first else { continue }
+            let included = wsIncludedImpl(rel, fileSize: values.fileSize ?? 0)
+            var bucket = buckets[top] ?? Bucket(isDir: comps.count > 1)
+            bucket.sizeBytes += size
+            if included {
+                bucket.fileCount += 1
+                bucket.includedBytes += size
+                includedCount += 1
+                includedTotal += size
+            } else {
+                bucket.excludedFileCount += 1
+            }
+            buckets[top] = bucket
+        }
+        // 拆成两步并显式标注类型：单表达式链（map + sorted + 多成员构造）会触发
+        // Swift 类型检查器超时，逻辑不变
+        let mapped: [WorkspaceFolderStat] = buckets.map { name, b in
+            WorkspaceFolderStat(
+                name: name,
+                isDirectory: b.isDir,
+                fileCount: b.fileCount,
+                excludedFileCount: b.excludedFileCount,
+                sizeBytes: b.sizeBytes,
+                includedBytes: b.includedBytes
+            )
+        }
+        // 总体积降序：最占地方的排最前，首页就能看到主要矛盾
+        let folders = mapped.sorted { lhs, rhs in
+            lhs.sizeBytes == rhs.sizeBytes ? lhs.name < rhs.name : lhs.sizeBytes > rhs.sizeBytes
+        }
+        return (folders, includedCount, includedTotal)
+    }
+
+    /// 工作区快照健康状态。页面下拉刷新即可重新计算；指纹一致性当场实测，
+    /// 不依赖上次注入的残留状态（进程刚起、从未注入过时为 false）。
+    public func workspaceSnapshotHealth() async -> WorkspaceSnapshotHealth {
+        let stats = await Task.detached(priority: .userInitiated) {
+            Self.workspaceFolderStats()
+        }.value
+        let current = documentsFingerprint()
+        let stable: Bool
+        if wsInjectedIntoCurrentPage, let fp = wsLastFingerprint {
+            stable = (fp == current)
+        } else {
+            stable = false
+        }
+        return WorkspaceSnapshotHealth(
+            includedFileCount: stats.includedFileCount,
+            includedBytes: stats.includedBytes,
+            maxBytes: Int64(Self.wsMaxTotalBytes),
+            maxFileCount: Self.wsMaxFileCount,
+            folders: stats.folders,
+            lastInjectionAt: wsLastInjectionAt,
+            lastInjectionFileCount: wsLastInjectionFileCount,
+            lastInjectionPayloadBytes: wsLastInjectionPayloadBytes,
+            lastSeedSkipped: wsLastSeedSkipped,
+            lastSeedOverGuard: wsLastSeedOverGuard,
+            fingerprintStable: stable
+        )
     }
 
     /// run 后调用：把 host.js 收集的 MEMFS 变更写回宿主 Documents。
@@ -1005,6 +1127,63 @@ public struct PyodidePackageInfo: Sendable, Identifiable, Hashable {
     public let version: String
     public let sizeBytes: Int64
     public var id: String { name.lowercased() }
+}
+
+/// Documents 顶层条目占用统计（体检页「根目录占用明细」行数据）
+public struct WorkspaceFolderStat: Sendable, Identifiable, Hashable {
+    public let name: String
+    public let isDirectory: Bool
+    /// 纳入快照的文件数
+    public let fileCount: Int
+    /// 被排除规则 / 单文件上限挡掉的文件数
+    public let excludedFileCount: Int
+    /// 总体积（含被排除部分）
+    public let sizeBytes: Int64
+    /// 实际进快照的体积
+    public let includedBytes: Int64
+
+    public var id: String { name }
+    /// 该条目是否完全没进快照（整树被排除）
+    public var isFullyExcluded: Bool { fileCount == 0 && excludedFileCount > 0 }
+}
+
+/// 工作区快照健康状态（体检页顶部卡片）
+public struct WorkspaceSnapshotHealth: Sendable {
+    public let includedFileCount: Int
+    public let includedBytes: Int64
+    public let maxBytes: Int64
+    public let maxFileCount: Int
+    public let folders: [WorkspaceFolderStat]
+
+    public let lastInjectionAt: Date?
+    public let lastInjectionFileCount: Int
+    public let lastInjectionPayloadBytes: Int
+    /// 最近一次 seed 是否走了「零开销跳过」分支
+    public let lastSeedSkipped: Bool
+    /// 最近一次 seed 是否因超护栏而放弃注入（MEMFS 退化为隔离态）
+    public let lastSeedOverGuard: Bool
+    /// 当前宿主指纹与上次注入时一致 → 下次 run 可跳过搬运
+    public let fingerprintStable: Bool
+
+    /// 体积占用率（0...1+，超护栏时 >1）
+    public var byteRatio: Double { maxBytes > 0 ? Double(includedBytes) / Double(maxBytes) : 0 }
+    /// 文件数占用率
+    public var fileCountRatio: Double { maxFileCount > 0 ? Double(includedFileCount) / Double(maxFileCount) : 0 }
+
+    public enum Level: String, Sendable {
+        /// 余量充足
+        case healthy
+        /// 已贴上限（≥80%），再涨就该清理或加排除了
+        case warning
+        /// 已超护栏，快照整包放弃、MEMFS 退化为隔离态
+        case overGuard
+    }
+
+    public var level: Level {
+        if lastSeedOverGuard || byteRatio >= 1 || fileCountRatio >= 1 { return .overGuard }
+        if byteRatio >= 0.8 || fileCountRatio >= 0.8 { return .warning }
+        return .healthy
+    }
 }
 
 // MARK: - WKScriptMessageHandler shim

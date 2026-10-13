@@ -145,4 +145,56 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
         // 0 字节放行
         XCTAssertTrue(PyodideBridge.wsIncludedImpl("tmp/empty", fileSize: 0))
     }
+
+    // MARK: - 体检页状态分级（WorkspaceSnapshotHealth.Level）
+
+    private func makeHealth(
+        includedBytes: Int64,
+        includedFileCount: Int,
+        overGuard: Bool = false
+    ) -> WorkspaceSnapshotHealth {
+        WorkspaceSnapshotHealth(
+            includedFileCount: includedFileCount,
+            includedBytes: includedBytes,
+            maxBytes: 32 * 1024 * 1024,
+            maxFileCount: 2000,
+            folders: [],
+            lastInjectionAt: nil,
+            lastInjectionFileCount: 0,
+            lastInjectionPayloadBytes: 0,
+            lastSeedSkipped: false,
+            lastSeedOverGuard: overGuard,
+            fingerprintStable: false
+        )
+    }
+
+    /// 余量充足 → 健康
+    func testLevel_healthy_belowThreshold() {
+        let h = makeHealth(includedBytes: 20 * 1024 * 1024, includedFileCount: 599)
+        XCTAssertEqual(h.level, .healthy)
+        XCTAssertLessThan(h.byteRatio, 0.7)
+    }
+
+    /// 体积或文件数任一 ≥80% 即预警（取先到的那条腿）。
+    /// 真机 2026-10-12 实测 26.8MB / 599 文件 → 84%，落在这一档，
+    /// 说明预警阈值定得有意义：当前设备确实已经贴脸。
+    func testLevel_warning_onEitherDimension() {
+        XCTAssertEqual(makeHealth(includedBytes: 27 * 1024 * 1024, includedFileCount: 599).level, .warning,
+                       "体积 84% 触警（真机当前就处在这一档）")
+        XCTAssertEqual(makeHealth(includedBytes: 20 * 1024 * 1024, includedFileCount: 1700).level, .warning,
+                       "文件数 85% 触警")
+        XCTAssertEqual(makeHealth(includedBytes: 20 * 1024 * 1024, includedFileCount: 599).level, .healthy,
+                       "两个维度都安全时不误报")
+    }
+
+    /// 触顶或超护栏 → 退化态
+    func testLevel_overGuard_onOverflowOrGuard() {
+        XCTAssertEqual(makeHealth(includedBytes: 33 * 1024 * 1024, includedFileCount: 599).level, .overGuard)
+        XCTAssertEqual(makeHealth(includedBytes: 32 * 1024 * 1024, includedFileCount: 599).level, .overGuard,
+                       "恰好等于上限也算触顶（guard 是 > 比较，体检从严）")
+        XCTAssertEqual(makeHealth(includedBytes: 20 * 1024 * 1024, includedFileCount: 2100).level, .overGuard,
+                       "文件数破 2000 同样退化")
+        XCTAssertEqual(makeHealth(includedBytes: 1, includedFileCount: 1, overGuard: true).level, .overGuard,
+                       "上次 seed 已超护栏时，即使当前体积回落也维持退化态提示")
+    }
 }
