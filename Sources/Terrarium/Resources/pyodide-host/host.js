@@ -500,22 +500,21 @@ async function runPython(id, code) {
 
   // 工作区快照恢复（I-4）：Swift 在 run 前注入的 Documents 快照写到
   // MEMFS 容器根绝对路径（HOME 已固化，open 即命中），manifest 落
-  // /persist 供 run 后 diff 收集。幂等：无 b64 时零开销跳过
-  // 取数双模式（v3）：同一份源码要同时服务两条通道——
-  //   · zlib 通道：Swift 压缩后经 ws scheme 伺服，JS fetch 出 ArrayBuffer，
-  //     由 wsGlobals 注入 `_ws_buf`（memoryview），须用 zlib.decompress(-15)
-  //     （Apple COMPRESSION_ZLIB 产出的是裸 DEFLATE/RFC1951，无头无校验尾）
-  //   · 旧 b64 通道：读 window.__MS_WS_B64__
-  // 分流条件必须写在这里：3a 期间 Swift 仍走 b64，只写 zlib 分支会撞未定义
-  // 的 _ws_buf（「3a 真机行为与现状逐字节一致」不成立）
+  // /persist 供 run 后 diff 收集。幂等：无 payload 时零开销跳过
+  // 唯一通道（步骤 4 起）：Swift 压缩后经 ws scheme 伺服，JS fetch 出
+  // ArrayBuffer，由 wsGlobals 注入 `_ws_buf`（memoryview），须用
+  // zlib.decompress(-15)——Apple COMPRESSION_ZLIB 产出的是裸 DEFLATE/
+  // RFC1951，无 0x78 头、无 adler32 尾，不带 -15 直接抛错
+  // 旧通道（Swift 分块 evaluate 往 JS 全局拼 MB 级 base64 字符串）已在此步
+  // 删除：压缩通道真机验证通过后无回退价值，留着只会让「取数到底走哪条」
+  // 在排障时多一个分叉。旧变量名不再出现在本文件任何可执行语句中
   const WS_RESTORE_SRC = [
     "import json as _msj, os as _mso, base64 as _msb, zlib as _msz",
     "_root = __import__('js').window.__MS_DOCROOT__ or ''",
     "if _root:",
-    "    if '_ws_buf' in globals():",
-    "        _raw = _msz.decompress(_ws_buf, -15).decode('utf-8')",
-    "    else:",
-    "        _raw = __import__('js').window.__MS_WS_B64__ or '[]'",
+    "    if '_ws_buf' not in globals():",
+    "        raise RuntimeError('ws buffer missing')",
+    "    _raw = _msz.decompress(_ws_buf, -15).decode('utf-8')",
     "    _ws = _msj.loads(_raw)",
     "    _keep = set(e['p'] for e in _ws)",
     "    _docs = _mso.path.join(_root, 'Documents')",
@@ -539,9 +538,8 @@ async function runPython(id, code) {
     "            _mf[_e['p']] = [_st.st_size, int(_st.st_mtime)]",
     "        except OSError: pass",
     "    _msj.dump(_mf, open('/persist/.ms_ws_manifest.json', 'w'))",
-    // 承重墙：两个变量都必须清。漏清 __MS_WS_URL__ 会让 auto-install 重跑
-    // （host.js 尾部）二次 restore，把首轮已删的文件复活
-    "__import__('js').window.__MS_WS_B64__ = None",
+    // 承重墙：URL 必须清。漏清会让 auto-install 重跑（host.js 尾部）
+    // 二次 restore，把首轮已删的文件复活
     "__import__('js').window.__MS_WS_URL__ = None",
   ].join("\n");
   // 工作区收集（I-4）：对比注入 manifest 与当前 MEMFS 容器根子树，
@@ -609,19 +607,6 @@ async function runPython(id, code) {
         if (wsBuf) { try { wsBuf.destroy(); } catch (_) {} }
         try { wsGlobals.destroy(); } catch (_) {}
       }
-    } else if (window.__MS_WS_B64__) {
-      try {
-        // 独立 globals（review m6）：临时变量不落用户命名空间
-        const wsGlobals = pyodide.toPy({});
-        try { await pyodide.runPythonAsync(WS_RESTORE_SRC, { globals: wsGlobals }); }
-        finally { wsGlobals.destroy(); }
-        // 对账会删 MEMFS 空目录，/tmp symlink 的目标必须在此后重建
-        if (window.__MS_DOCROOT__) {
-          try { pyodide.FS.mkdirTree(window.__MS_DOCROOT__ + "/Documents/tmp"); }
-          catch (e) { console.warn("[pyodide] /tmp 目标目录重建失败:", e); }
-        }
-        window.__MS_WS_READY__ = true;
-      } catch (e) { console.warn("[pyodide] 工作区恢复失败:", e); }
     } else if (window.__MS_DOCROOT__ && window.__MS_WS_SKIPPED__) {
       // 跳过≠可疑（2026-10-11 超护栏事故收尾）：护栏主动跳过注入时，
       // Documents 写入通道降级为「MEMFS 白纸 + 轮末收集回写」而非熔断——

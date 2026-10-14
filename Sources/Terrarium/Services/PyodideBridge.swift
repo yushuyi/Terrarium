@@ -453,7 +453,13 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 最近一次注入记录（仅进程内，供 DEBUG「Pyodide 运行时体检」页展示）
     private var wsLastInjectionAt: Date?
     private var wsLastInjectionFileCount = 0
+    /// 上次注入「过线」的字节数：即压缩后经 ws scheme 交付的字节数。
+    /// 旧 b64 通道时它是压缩前的 JSON 字节，步骤 4 起口径改为压缩后——
+    /// 体检页要看的是真实搬运量，两段式文案的另一半由下面这个字段给
     private var wsLastInjectionPayloadBytes = 0
+    /// 上次注入「压缩前」的 JSON 字节数（36.7MB 量级）。与上一行的差值
+    /// 就是 zlib 的实际收益，体检页两段式文案的前半段
+    private var wsLastInjectionUncompressedBytes = 0
     /// 最近一次 seed 走了哪条分支：跳过 / 超护栏退化 / 正常注入
     private var wsLastSeedSkipped = false
     private var wsLastSeedOverGuard = false
@@ -670,10 +676,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
     }
 
     /// run 前调用：宿主 Documents 快照注入 MEMFS。
-    /// 注入的是 [{p: 相对Documents路径, d: base64}] JSON（分块，单次
-    /// evaluate 传 MB 级字符串易触发 WebKit 上限）；解包由 host.js 的
-    /// runUser 开头执行（b64 就位时先 restore 再跑用户代码）。指纹与
-    /// 页面标志双重判断，宿主未变且 MEMFS 仍持有快照时零开销跳过。
+    /// 注入的是 [{p: 相对Documents路径, d: base64}] JSON，整体 zlib 压缩后
+    /// 由 ws scheme 在内存里伺服；Swift 侧只 evaluate 一个 URL 字符串，
+    /// host.js 的 runUser 开头 fetch + 解压 + restore 再跑用户代码。
+    /// 指纹与页面标志双重判断，宿主未变且 MEMFS 仍持有快照时零开销跳过。
     func seedWorkspaceMirror() async -> String {
         // 必须让 JS 返回 String：boolean 会被 evaluate 的 as? String 丢弃
         let readyOnPage = await evaluate("String(window.__MS_WS_READY__ === true)")
@@ -689,14 +695,19 @@ public final class PyodideBridge: NSObject, ObservableObject {
         if wsInjectedIntoCurrentPage,
            let fp = wsLastFingerprint,
            fp == documentsFingerprint() {
-            recordSeed(at: Date(), fileCount: wsLastInjectionFileCount, payloadBytes: wsLastInjectionPayloadBytes,
+            // 沿用上次的体积（本轮没搬任何字节）：体检页 skip 行据此展示
+            // 「上次注入的实际量级」，否则稳态下最常被看到的那行反而最没信息
+            recordSeed(at: Date(), fileCount: wsLastInjectionFileCount,
+                       payloadBytes: wsLastInjectionPayloadBytes,
+                       uncompressedBytes: wsLastInjectionUncompressedBytes,
                        skipped: true, overGuard: false)
             return "" // MEMFS 与宿主一致，零开销跳过
         }
         guard let fingerprint = documentsFingerprint() else {
             AppLog.log("[Pyodide] 工作区快照跳过：Documents 超护栏（>32MB 或 >2000 文件）",
                    log: Log.pyodide)
-            recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, skipped: true, overGuard: true)
+            recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, uncompressedBytes: 0,
+                       skipped: true, overGuard: true)
             // 跳过≠可疑：host.js 据此走「白纸 + 收集回写」降级通道而非熔断
             _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
             return ""
@@ -705,7 +716,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
             Self.packSnapshotEntries()
         }.value
         guard let (entries, payloadData) = packed else {
-            recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, skipped: true, overGuard: true)
+            recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, uncompressedBytes: 0,
+                       skipped: true, overGuard: true)
             _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
             return ""
         }
@@ -714,7 +726,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
             Self.zlibCompress(payloadData)
         }.value
         guard let compressed else {
-            recordSeed(at: Date(), fileCount: entries.count, payloadBytes: payloadData.count,
+            // 压缩失败：原始字节已知，如实记账（体检页 overGuard 行不展示
+            // 体积，但日志与后续排障要看得到量级）
+            recordSeed(at: Date(), fileCount: entries.count, payloadBytes: 0,
+                       uncompressedBytes: payloadData.count,
                        skipped: true, overGuard: true)
             _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
             AppLog.log("[Pyodide] 工作区快照压缩失败，本轮不恢复（文件数=%{public}ld）",
@@ -744,7 +759,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
         }
         wsLastFingerprint = fingerprint
         wsInjectedIntoCurrentPage = true
-        recordSeed(at: Date(), fileCount: entries.count, payloadBytes: payloadData.count,
+        recordSeed(at: Date(), fileCount: entries.count, payloadBytes: compressed.count,
+                   uncompressedBytes: payloadData.count,
                    skipped: false, overGuard: false)
         // 注入成功即清除跳过标记：同页后续 run 的告警语义回到 ready 口径
         _ = await evaluate("window.__MS_WS_SKIPPED__ = false; 'ok'")
@@ -754,10 +770,12 @@ public final class PyodideBridge: NSObject, ObservableObject {
     }
 
     /// 记录最近一次 seed 分支（体检页数据源，不参与注入决策）
-    private func recordSeed(at date: Date, fileCount: Int, payloadBytes: Int, skipped: Bool, overGuard: Bool) {
+    private func recordSeed(at date: Date, fileCount: Int, payloadBytes: Int,
+                            uncompressedBytes: Int, skipped: Bool, overGuard: Bool) {
         wsLastInjectionAt = date
         wsLastInjectionFileCount = fileCount
         wsLastInjectionPayloadBytes = payloadBytes
+        wsLastInjectionUncompressedBytes = uncompressedBytes
         wsLastSeedSkipped = skipped
         wsLastSeedOverGuard = overGuard
     }
@@ -849,6 +867,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
             lastInjectionAt: wsLastInjectionAt,
             lastInjectionFileCount: wsLastInjectionFileCount,
             lastInjectionPayloadBytes: wsLastInjectionPayloadBytes,
+            lastInjectionUncompressedBytes: wsLastInjectionUncompressedBytes,
             lastSeedSkipped: wsLastSeedSkipped,
             lastSeedOverGuard: wsLastSeedOverGuard,
             fingerprintStable: stable
@@ -1280,13 +1299,66 @@ public struct WorkspaceSnapshotHealth: Sendable {
 
     public let lastInjectionAt: Date?
     public let lastInjectionFileCount: Int
+    /// 上次注入真实过线的字节数（压缩后经 ws scheme 交付的量）
     public let lastInjectionPayloadBytes: Int
+    /// 上次注入压缩前的 JSON 字节数。与上一行的差值 = zlib 实际收益。
+    /// 两者都暴露是因为压缩比完全取决于 included 集的内容构成：文本为主
+    /// 时能压到 1/6，二进制（png/zip）为主时趋近 1——只有两个数摆在一起
+    /// 才能一眼看出当前落在哪一端，而不是赌一个好看的压缩率
+    public let lastInjectionUncompressedBytes: Int
     /// 最近一次 seed 是否走了「零开销跳过」分支
     public let lastSeedSkipped: Bool
     /// 最近一次 seed 是否因超护栏而放弃注入（MEMFS 退化为隔离态）
     public let lastSeedOverGuard: Bool
     /// 当前宿主指纹与上次注入时一致 → 下次 run 可跳过搬运
     public let fingerprintStable: Bool
+
+    /// 显式 init 而非靠 memberwise init：后者不支持默认参数，新增字段会
+    /// 打断既有构造点（体检页 VC、单测工厂）。给默认值 = 零破坏扩展
+    public init(
+        includedFileCount: Int,
+        includedBytes: Int64,
+        maxBytes: Int64,
+        maxFileCount: Int,
+        folders: [WorkspaceFolderStat],
+        lastInjectionAt: Date?,
+        lastInjectionFileCount: Int,
+        lastInjectionPayloadBytes: Int,
+        lastInjectionUncompressedBytes: Int = 0,
+        lastSeedSkipped: Bool,
+        lastSeedOverGuard: Bool,
+        fingerprintStable: Bool
+    ) {
+        self.includedFileCount = includedFileCount
+        self.includedBytes = includedBytes
+        self.maxBytes = maxBytes
+        self.maxFileCount = maxFileCount
+        self.folders = folders
+        self.lastInjectionAt = lastInjectionAt
+        self.lastInjectionFileCount = lastInjectionFileCount
+        self.lastInjectionPayloadBytes = lastInjectionPayloadBytes
+        self.lastInjectionUncompressedBytes = lastInjectionUncompressedBytes
+        self.lastSeedSkipped = lastSeedSkipped
+        self.lastSeedOverGuard = lastSeedOverGuard
+        self.fingerprintStable = fingerprintStable
+    }
+
+    /// 上次注入的体积口径文案（**不含时间**，由 UI 侧拼装）。
+    /// 两段式：压缩前 → 压缩后，让压缩收益直接可观测；skip 分支也必须带
+    /// 体积——指纹一致是常态，恰恰是这一行被看得最多，不带等于把最该
+    /// 观察的稳态藏起来了（v4 验收项）
+    public var lastInjectionVolumeText: String {
+        if lastSeedOverGuard { return "超护栏放弃注入，MEMFS 退化为隔离态" }
+        let raw = Self.byteText(lastInjectionUncompressedBytes)
+        if lastSeedSkipped {
+            return "指纹一致，零开销跳过 · 上次注入 \(raw)"
+        }
+        return "\(lastInjectionFileCount) 个文件 · 原始 \(raw) → 压缩 \(Self.byteText(lastInjectionPayloadBytes))"
+    }
+
+    private static func byteText(_ bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .binary)
+    }
 
     /// 体积占用率（0...1+，超护栏时 >1）
     public var byteRatio: Double { maxBytes > 0 ? Double(includedBytes) / Double(maxBytes) : 0 }

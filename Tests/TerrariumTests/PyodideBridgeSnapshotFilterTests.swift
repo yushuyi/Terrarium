@@ -226,7 +226,10 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
     private func makeHealth(
         includedBytes: Int64,
         includedFileCount: Int,
-        overGuard: Bool = false
+        overGuard: Bool = false,
+        lastPayloadBytes: Int = 0,
+        lastUncompressedBytes: Int = 0,
+        skipped: Bool = false
     ) -> WorkspaceSnapshotHealth {
         WorkspaceSnapshotHealth(
             includedFileCount: includedFileCount,
@@ -235,12 +238,17 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
             maxFileCount: 2000,
             folders: [],
             lastInjectionAt: nil,
-            lastInjectionFileCount: 0,
-            lastInjectionPayloadBytes: 0,
-            lastSeedSkipped: false,
+            lastInjectionFileCount: includedFileCount,
+            lastInjectionPayloadBytes: lastPayloadBytes,
+            lastInjectionUncompressedBytes: lastUncompressedBytes,
+            lastSeedSkipped: skipped,
             lastSeedOverGuard: overGuard,
             fingerprintStable: false
         )
+    }
+
+    private func byteText(_ bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .binary)
     }
 
     /// 余量充足 → 健康
@@ -271,5 +279,70 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
                        "文件数破 2000 同样退化")
         XCTAssertEqual(makeHealth(includedBytes: 1, includedFileCount: 1, overGuard: true).level, .overGuard,
                        "上次 seed 已超护栏时，即使当前体积回落也维持退化态提示")
+    }
+
+    // MARK: - 上次注入文案（两段式：原始 → 压缩）
+
+    /// 正常注入：必须同时给出压缩前与压缩后两个数。只给一个是没意义的——
+    /// 压缩比完全取决于 included 集的内容构成，两个数字摆在一起才能看出
+    /// 当前落在「文本为主（压得动）」还是「二进制为主（压不动）」
+    func testLastInjectionVolumeText_normal_isTwoLegged() {
+        let h = makeHealth(
+            includedBytes: 20 * 1024 * 1024,
+            includedFileCount: 599,
+            lastPayloadBytes: 5_500_000,
+            lastUncompressedBytes: 37_000_000
+        )
+        XCTAssertEqual(
+            h.lastInjectionVolumeText,
+            "599 个文件 · 原始 \(byteText(37_000_000)) → 压缩 \(byteText(5_500_000))"
+        )
+    }
+
+    /// skip 分支必须带体积（v4 验收项）。指纹一致是稳态、这一行被看得最多，
+    /// 不带体积等于把最该被观察的状态藏起来——历史上正是这里最先被省掉
+    func testLastInjectionVolumeText_skippedStillCarriesVolume() {
+        let h = makeHealth(
+            includedBytes: 20 * 1024 * 1024,
+            includedFileCount: 599,
+            lastPayloadBytes: 5_500_000,
+            lastUncompressedBytes: 37_000_000,
+            skipped: true
+        )
+        let text = h.lastInjectionVolumeText
+        XCTAssertTrue(text.hasPrefix("指纹一致，零开销跳过"), text)
+        XCTAssertTrue(text.contains(byteText(37_000_000)), "skip 行必须带体积：\(text)")
+        XCTAssertFalse(text.contains("个文件"), "skip 本轮没搬文件，不该报文件数：\(text)")
+    }
+
+    /// 超护栏分支维持原口径（此时没有体积可展示，讲的是降级通道）
+    func testLastInjectionVolumeText_overGuard() {
+        let h = makeHealth(includedBytes: 33 * 1024 * 1024, includedFileCount: 599, overGuard: true)
+        XCTAssertEqual(h.lastInjectionVolumeText, "超护栏放弃注入，MEMFS 退化为隔离态")
+    }
+
+    /// 新字段带默认值：既有构造点（体检页 VC、本文件工厂）不传也能编译。
+    /// struct 靠 memberwise init 是不支持默认参数的，只能显式写 init——
+    /// 这条用例锁住「扩展不破坏调用方」这个前提
+    func testLastInjectionUncompressedBytes_defaultsToZero() {
+        let h = makeHealth(includedBytes: 1, includedFileCount: 1)
+        XCTAssertEqual(h.lastInjectionUncompressedBytes, 0)
+    }
+
+    /// 旧 b64 通道删除的回归防线。留着旧变量会让「取数到底走哪条」在排障时
+    /// 多一个分叉，且 Swift 侧已不再写它——JS 侧留分支等于留一段死代码
+    func testHostJs_hasNoLegacyB64Channel() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // Tests/TerrariumTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // 包根
+            .appendingPathComponent("Sources/Terrarium/Resources/pyodide-host/host.js")
+        let text = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertFalse(text.contains("__MS_WS_B64__"), "host.js 不得再出现旧通道变量")
+        XCTAssertTrue(text.contains("__MS_WS_URL__"), "新通道变量必须还在")
+        XCTAssertTrue(text.contains("_msz.decompress(_ws_buf, -15)"),
+                      "仍须用 -15 解裸 DEFLATE（Apple COMPRESSION_ZLIB 无头无校验尾）")
+        XCTAssertTrue(text.contains("raise RuntimeError('ws buffer missing')"),
+                      "buffer 缺失要显式报错，不能退化成静默空解")
     }
 }
