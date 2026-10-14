@@ -24,6 +24,7 @@
 import Foundation
 import os
 import WebKit
+import Compression
 import MSFoundation
 
 @MainActor
@@ -542,6 +543,62 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 避免主线程数百毫秒卡顿。entry 的 p 统一为相对容器根（Documents/
     /// 前缀），与 host.js 的 restore 落位（join(DOCROOT, p)）及收集/
     /// 写回的 key 语义一致
+    // MARK: - zlib 压缩通道（工作区快照）
+
+    /// 裸 DEFLATE（RFC1951）压缩——**不是** RFC1950 标准 zlib 流。
+    ///
+    /// ⚠️⚠️ Apple `COMPRESSION_ZLIB` 产出的是裸 DEFLATE：本地实测输出首字节
+    /// 0xcb/0xed/0x8b，无 0x78 头、尾 4 字节与 adler32(src) 不符（无校验尾）。
+    /// Apple 官方文档原文：等价
+    /// `deflateInit2(zstream, 5, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY)`，
+    /// **编码器固定 level 5**（无调参空间）。因此 Python 侧必须
+    /// `zlib.decompress(buf, -15)`（负 wbits = 无头解）；直接
+    /// `zlib.decompress(buf)` 会抛 `Error -3 incorrect header check`。
+    ///
+    /// ⚠️ 目的缓冲必须按 `src + src/1000 + 12 + 64` 分配：按 `src.count` 分配时
+    /// 极小载荷（`[]` 2 字节）会静默失败返回 0（实测压缩后为 4 字节）——新装
+    /// 设备空 Documents 会静默走降级。
+    ///
+    /// - Returns: 压缩后的 Data；失败（含缓冲不足）返回 nil
+    nonisolated static func zlibCompress(_ data: Data) -> Data? {
+        let srcSize = data.count
+        guard srcSize > 0 else { return nil }
+        let dstSize = srcSize + srcSize / 1000 + 12 + 64
+        var dst = [UInt8](repeating: 0, count: dstSize)
+        let outSize = data.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Int in
+            guard let base = src.baseAddress else { return 0 }
+            return compression_encode_buffer(
+                &dst, dstSize,
+                base.assumingMemoryBound(to: UInt8.self), srcSize,
+                nil, COMPRESSION_ZLIB
+            )
+        }
+        // 0 = 失败（缓冲不足或输入异常）；正常压缩至少产出数字节
+        guard outSize > 0, outSize <= dstSize else { return nil }
+        return Data(dst[0..<outSize])
+    }
+
+    /// 裸 DEFLATE 解压（`zlibCompress` 的逆操作）。
+    ///
+    /// - Parameters:
+    ///   - data: `zlibCompress` 的产物（裸 DEFLATE）
+    ///   - decompressedSize: 压缩前字节数（known-size 场景由调用方记录并传递）
+    /// - Returns: 还原后的 Data；失败返回 nil
+    nonisolated static func zlibDecompress(_ data: Data, decompressedSize: Int) -> Data? {
+        guard decompressedSize > 0 else { return nil }
+        var dst = [UInt8](repeating: 0, count: decompressedSize)
+        let outSize = data.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Int in
+            guard let base = src.baseAddress else { return 0 }
+            return compression_decode_buffer(
+                &dst, decompressedSize,
+                base.assumingMemoryBound(to: UInt8.self), data.count,
+                nil, COMPRESSION_ZLIB
+            )
+        }
+        guard outSize > 0, outSize <= decompressedSize else { return nil }
+        return Data(dst[0..<outSize])
+    }
+
     private nonisolated static func packSnapshotEntries() -> ([[String: String]], String)? {
         let fm = FileManager.default
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
