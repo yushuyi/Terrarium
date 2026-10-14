@@ -618,7 +618,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 上一轮的陈旧快照。
     nonisolated(unsafe) static var wsSnapshotProvider: (() -> Data?)?
 
-    private nonisolated static func packSnapshotEntries() -> ([[String: String]], String)? {
+    /// 产物直接给 JSON `Data`（压缩通道的输入）——原先产 String 再转 utf8
+    /// 会多一次 36.7MB 全量拷贝，是 Swift 侧内存峰值的大头之一
+    private nonisolated static func packSnapshotEntries() -> ([[String: String]], Data)? {
         let fm = FileManager.default
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
         guard let enumerator = fm.enumerator(at: docs, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]) else {
@@ -636,9 +638,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
                   let data = try? Data(contentsOf: url) else { continue }
             entries.append(["p": "Documents/" + rel, "d": data.base64EncodedString()])
         }
-        guard let payloadData = try? JSONSerialization.data(withJSONObject: entries),
-              let payload = String(data: payloadData, encoding: .utf8) else { return nil }
-        return (entries, payload)
+        guard let payloadData = try? JSONSerialization.data(withJSONObject: entries) else { return nil }
+        return (entries, payloadData)
     }
 
     /// Documents 递归指纹。返回 nil 表示超护栏或枚举失败（不启用快照桥）。
@@ -703,46 +704,52 @@ public final class PyodideBridge: NSObject, ObservableObject {
         let packed = await Task.detached(priority: .userInitiated) {
             Self.packSnapshotEntries()
         }.value
-        guard let (entries, payload) = packed else {
+        guard let (entries, payloadData) = packed else {
             recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, skipped: true, overGuard: true)
             _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
             return ""
         }
-        var injected = 0
-        var idx = payload.startIndex
-        while idx < payload.endIndex {
-            // 注入途中进程死亡/重载（review P1-1）：残块会写进重生后新页的
-            // window.__MS_WS_B64__，污染下轮注入的长度校验；即刻中止并清空
-            guard isReady else {
-                _ = await evaluate("window.__MS_WS_B64__ = null; 'ok'")
-                AppLog.log("[Pyodide] 快照注入中止（运行时已重置，已注入 %{public}ld 块）",
-                       log: Log.pyodide, Int32(injected))
-                return ""
-            }
-            let end = payload.index(idx, offsetBy: 1_000_000, limitedBy: payload.endIndex) ?? payload.endIndex
-            let chunk = String(payload[idx..<end])
-            let op = injected == 0 ? "=" : "+="
-            _ = await evaluate("window.__MS_WS_B64__ \(op) \(Self.jsStringLiteral(chunk)); 'ok'")
-            injected += 1
-            idx = end
+        // 压缩必须放在 detached 内：26.8MB 压缩约 0.3-0.8s，主线程做会卡 UI
+        let compressed = await Task.detached(priority: .userInitiated) {
+            Self.zlibCompress(payloadData)
+        }.value
+        guard let compressed else {
+            recordSeed(at: Date(), fileCount: entries.count, payloadBytes: payloadData.count,
+                       skipped: true, overGuard: true)
+            _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
+            AppLog.log("[Pyodide] 工作区快照压缩失败，本轮不恢复（文件数=%{public}ld）",
+                   log: Log.pyodide, Int32(entries.count))
+            return ""
         }
-        // 注入完成校验（review M2）：evaluate 1s 竞速可能静默丢块，长度
-        // 不符则清空 b64 并不置标志——host.js 不 restore，下轮重注入
-        let actual = await evaluate("String(window.__MS_WS_B64__ ? window.__MS_WS_B64__.length : 0)")
-        guard actual == String(payload.utf16.count) else {
-            _ = await evaluate("window.__MS_WS_B64__ = null; 'ok'")
-            AppLog.log("[Pyodide] 工作区快照注入长度校验失败（期望 %{public}ld 实际 %{public}@），本轮不恢复",
-                   log: Log.pyodide, Int32(payload.utf16.count), actual)
+        // v4：压缩在 detached 里跑的窗口期进程可能已重置；不补这道 guard，
+        // URL 的 evaluate 会落在重建后的新页上，白费一轮 404 → 降级
+        guard isReady else {
+            AppLog.log("[Pyodide] 快照注入中止（压缩完成但运行时已重置）", log: Log.pyodide)
+            return ""
+        }
+        // 内存伺服：压缩 Data 由 bridge 持有，ws scheme 分支按请求读出
+        Self.wsSnapshotProvider = { compressed }
+        let wsURL = "\(PyodideSchemeHandler.scheme)://ws/snapshot"
+        _ = await evaluate("window.__MS_WS_URL__ = \(Self.jsStringLiteral(wsURL)); 'ok'")
+        // 回读校验（review M2 防线）：evaluate 可能静默丢值，URL 对不上就
+        // 清空 provider —— host.js 拿不到 URL 会走 B64 兜底（步骤 4 前）/
+        // 直接不恢复（步骤 4 后），都不会用陈旧数据
+        let actual = await evaluate("String(window.__MS_WS_URL__ || '')")
+        guard actual == wsURL else {
+            Self.wsSnapshotProvider = nil
+            _ = await evaluate("window.__MS_WS_URL__ = null; 'ok'")
+            AppLog.log("[Pyodide] 工作区快照 URL 回读校验失败（期望 %{public}@ 实际 %{public}@），本轮不恢复",
+                   log: Log.pyodide, wsURL, actual)
             return ""
         }
         wsLastFingerprint = fingerprint
         wsInjectedIntoCurrentPage = true
-        recordSeed(at: Date(), fileCount: entries.count, payloadBytes: payload.utf8.count,
+        recordSeed(at: Date(), fileCount: entries.count, payloadBytes: payloadData.count,
                    skipped: false, overGuard: false)
         // 注入成功即清除跳过标记：同页后续 run 的告警语义回到 ready 口径
         _ = await evaluate("window.__MS_WS_SKIPPED__ = false; 'ok'")
-        AppLog.log("[Pyodide] 工作区快照注入完成 文件数=%{public}ld payload=%{public}ld 字节",
-               log: Log.pyodide, Int32(entries.count), Int32(payload.utf8.count))
+        AppLog.log("[Pyodide] 工作区快照注入完成 文件数=%{public}ld 原始=%{public}ld 字节 压缩后=%{public}ld 字节",
+               log: Log.pyodide, Int32(entries.count), Int32(payloadData.count), Int32(compressed.count))
         return ""
     }
 
