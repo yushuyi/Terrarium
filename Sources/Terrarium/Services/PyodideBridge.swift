@@ -485,6 +485,44 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 发现）。前缀表统一 "dir/" 形态：剥尾斜杠后与「目录部分」逐段精确
     /// 比较——既不放走嵌套，也不误杀共享前缀名（backups-archive/ 等）；
     /// 末段是文件名不参与目录匹配（根级同名文件保持放行，与旧语义一致）。
+    /// 临时脚本末段形态（UUID 尾）：命中者视为不存在——不进指纹、不进包、
+    /// 不进写回对账。
+    ///
+    /// 为什么必须识别：run_script / inline_py / grep_o 三类临时脚本每次执行
+    /// 都带新的 36 字符 UUID 文件名，指纹必变 → 每跑一条命令就触发一次全量
+    /// 重搬（批次实测 8 条 pyodide 命令 = 8 次注入、每次 4.5-5.5s）。
+    ///
+    /// ⚠️ 必须锚定 UUID 长度：v1 的 `run_script_*.py` 裸前缀匹配会误杀用户
+    /// 自带的 `run_script_notes.py`（pyodide 改写它 → WS_COLLECT 上报写回 →
+    /// validatedRel 拒绝 → 用户修改静默丢失，且 pyodide 读它直接
+    /// FileNotFoundError）。UUID 长度锚定后误杀归零。
+    ///
+    /// 已静态确认：排除 run_script 不影响执行——`_mianshu_dispatcher.py`
+    /// 以 JSON 字符串转发代码，script_path 仅作 compile 文件名。
+    ///
+    /// 实现选择：用纯字符串判定而非 NSRegularExpression——后者是
+    /// 非 Sendable 类，放进 `nonisolated static let` 在严格并发下会告警，
+    /// 而本规则的形态足够简单（前缀 + 36 位 UUID + 后缀），语义等价且零依赖。
+    nonisolated static func isTempScriptPath(_ rel: String) -> Bool {
+        guard let last = rel.split(separator: "/").last else { return false }
+        let seg = String(last).lowercased()
+        guard seg.hasSuffix(".py") || seg.hasSuffix(".sh") else { return false }
+        let stem = String(seg.dropLast(3))
+        // 前缀长度：".inline_py_" = 11、".grep_o_" = 8、"run_script_" = 11
+        if stem.hasPrefix(".inline_py_") { return isUUIDTail(String(stem.dropFirst(11))) }
+        if stem.hasPrefix(".grep_o_") { return isUUIDTail(String(stem.dropFirst(8))) }
+        if stem.hasPrefix("run_script_") {
+            // .py 与 .sh 两种变体一并覆盖（TerminalCommandRewriter 亦产 .sh）
+            return isUUIDTail(String(stem.dropFirst(11)))
+        }
+        return false
+    }
+
+    /// UUID 尾判据：恰好 36 个字符，且只含十六进制数字与短横线
+    nonisolated static func isUUIDTail(_ s: String) -> Bool {
+        s.count == 36 && s.allSatisfy { $0.isHexDigit || $0 == "-" }
+    }
+
     nonisolated static func wsIncludedImpl(_ rel: String, fileSize: Int) -> Bool {
         if wsExcludedFiles.contains(rel) { return false }
         let comps = rel.split(separator: "/").map(String.init)
@@ -493,6 +531,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
            Self.wsExcludedFileSuffixes.contains(where: { last.lowercased().hasSuffix($0) }) {
             return false
         }
+        // 末段形态匹配：临时脚本（UUID 尾）视为不存在，指纹/注入/写回三处共用
+        if Self.isTempScriptPath(rel) { return false }
         let dirNames = Set(wsExcludedPrefixes.map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 })
         if comps.dropLast().contains(where: dirNames.contains) { return false }
         return fileSize <= wsMaxFileBytes
