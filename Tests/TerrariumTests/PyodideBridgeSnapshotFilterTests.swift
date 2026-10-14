@@ -322,8 +322,9 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
     }
 
     /// 新字段带默认值：既有构造点（体检页 VC、本文件工厂）不传也能编译。
-    /// struct 靠 memberwise init 是不支持默认参数的，只能显式写 init——
-    /// 这条用例锁住「扩展不破坏调用方」这个前提。
+    /// memberwise init 对带默认值属性会生成默认参数，但它是 internal 的，
+    /// 公开 struct 跨模块构造必须显式 init——这条用例锁住「扩展不破坏
+    /// 调用方」这个前提。
     /// review fix：必须**裸调 init 省略新参数**才能真正锁住默认值——
     /// 走 makeHealth 工厂时新参数被工厂自己的默认值显式填上了，
     /// 删掉 init 的 `= 0` 该测试也照样通过（防线比声称的弱一档）

@@ -564,9 +564,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// `zlib.decompress(buf, -15)`（负 wbits = 无头解）；直接
     /// `zlib.decompress(buf)` 会抛 `Error -3 incorrect header check`。
     ///
-    /// ⚠️ 目的缓冲必须按 `src + src/1000 + 12 + 64` 分配：按 `src.count` 分配时
-    /// 极小载荷（`[]` 2 字节）会静默失败返回 0（实测压缩后为 4 字节）——新装
-    /// 设备空 Documents 会静默走降级。
+    /// ⚠️ 目的缓冲必须按 `src + src/1000 + 12 + 64` 分配：早期按 `src.count`
+    /// 分配的版本极小载荷（`[]` 2 字节）会静默失败返回 0；**现公式下 2 字节
+    /// 实测可正常压缩**（`testEmptyWorkspacePayload_twoBytes` 锁住此行为）。
     ///
     /// - Returns: 压缩后的 Data；失败（含缓冲不足）返回 nil
     nonisolated static func zlibCompress(_ data: Data) -> Data? {
@@ -727,7 +727,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
         }.value
         guard let compressed else {
             // 压缩失败：原始字节已知，如实记账（体检页 overGuard 行不展示
-            // 体积，但日志与后续排障要看得到量级）
+            // 体积，但日志与后续排障要看得到量级）。语义借用说明：overGuard
+            // 口径在此表示「放弃注入」而非「超护栏」，低频路径不值得为它
+            // 扩 UI 状态机，细分文案留二期
             recordSeed(at: Date(), fileCount: entries.count, payloadBytes: 0,
                        uncompressedBytes: payloadData.count,
                        skipped: true, overGuard: true)
@@ -1313,8 +1315,9 @@ public struct WorkspaceSnapshotHealth: Sendable {
     /// 当前宿主指纹与上次注入时一致 → 下次 run 可跳过搬运
     public let fingerprintStable: Bool
 
-    /// 显式 init 而非靠 memberwise init：后者不支持默认参数，新增字段会
-    /// 打断既有构造点（体检页 VC、单测工厂）。给默认值 = 零破坏扩展
+    /// 显式 init 而非靠 memberwise init：memberwise 对带默认值的属性虽会
+    /// 生成默认参数，但隐式 init 是 internal 的——公开 struct 跨模块
+    /// （主仓）构造必须显式 init；新增字段在这里给默认值 = 零破坏扩展
     public init(
         includedFileCount: Int,
         includedBytes: Int64,

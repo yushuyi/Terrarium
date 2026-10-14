@@ -514,7 +514,7 @@ async function runPython(id, code) {
     "if _root:",
     "    if '_ws_buf' not in globals():",
     "        raise RuntimeError('ws buffer missing')",
-    "    _raw = _msz.decompress(_ws_buf, -15).decode('utf-8')",
+    "    _raw = _msz.decompress(_ws_buf, -15)  # bytes：json.loads 自动探测 UTF-8，省 36MB 瞬态 str",
     "    _ws = _msj.loads(_raw)",
     "    _keep = set(e['p'] for e in _ws)",
     "    _docs = _mso.path.join(_root, 'Documents')",
