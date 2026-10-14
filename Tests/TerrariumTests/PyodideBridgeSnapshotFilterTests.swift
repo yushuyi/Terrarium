@@ -146,12 +146,90 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
         XCTAssertTrue(PyodideBridge.wsIncludedImpl("tmp/empty", fileSize: 0))
     }
 
+    // MARK: - 临时脚本（UUID 尾）指纹排除
+
+    /// 真机实证形态：36 字符 UUID（8-4-4-4-12）
+    private let uuid = "2D61D33E-1A2B-4C3D-9E8F-0A1B2C3D4E5F"
+
+    /// 三类临时脚本 → 排除。真机实证形态 `tmp/run_script_<UUID>.py`
+    /// （无 Documents/ 前缀），故规则统一作用于**末段**
+    func testExcluded_tempScripts_threeRealShapes() {
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("tmp/run_script_\(uuid).py", fileSize: 512))
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("tmp/.inline_py_\(uuid).py", fileSize: 512))
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("tmp/.grep_o_\(uuid).py", fileSize: 512))
+    }
+
+    /// .sh 变体一并覆盖（TerminalCommandRewriter 亦产 .sh）
+    func testExcluded_tempScripts_shVariant() {
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("tmp/run_script_\(uuid).sh", fileSize: 512))
+    }
+
+    /// 任意深度生效：命中判定只看末段，与所在目录无关
+    func testExcluded_tempScripts_anyDepthAndRoot() {
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("run_script_\(uuid).py", fileSize: 512),
+                       "Documents 根层的临时脚本同样排除")
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("tmp/a/b/.inline_py_\(uuid).py", fileSize: 512),
+                       "嵌套子目录同样排除")
+    }
+
+    /// 大小写不敏感：UUID 十六进制可能全大写或全小写
+    func testExcluded_tempScripts_caseInsensitive() {
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("tmp/run_script_\(uuid.lowercased()).py", fileSize: 512))
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("tmp/RUN_SCRIPT_\(uuid.uppercased()).PY", fileSize: 512))
+    }
+
+    /// **误杀防护（本规则的核心价值）**：v1 的 `run_script_*.py` 裸前缀匹配
+    /// 会命中用户自建文档 `run_script_notes.py`——pyodide 改写它后 collect
+    /// 上报写回、validatedRel 拒绝 → 用户修改静默丢失，且读它直接
+    /// FileNotFoundError。UUID 长度锚定后这类文件必须放行
+    func testIncluded_tempScriptLookalikes_mustNotBeExcluded() {
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl("run_script_notes.py", fileSize: 512),
+                      "用户自建的 run_script_notes.py 必须放行")
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl("docs/run_script_tutorial.py", fileSize: 512))
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl("my.inline_py_abc.py", fileSize: 512),
+                      "非 UUID 尾的同形态文件必须放行")
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl(".inline_py_notes.py", fileSize: 512))
+    }
+
+    /// 长度边界：UUID 恰好 36 位才命中，35 / 37 位都不是临时脚本
+    func testTempScript_uuidLengthBoundary() {
+        let uuid35 = String(uuid.dropLast())
+        let uuid37 = uuid + "A"
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl("tmp/run_script_\(uuid35).py", fileSize: 512),
+                      "35 位不命中（长度锚定生效）")
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl("tmp/run_script_\(uuid37).py", fileSize: 512),
+                      "37 位不命中")
+        XCTAssertFalse(PyodideBridge.wsIncludedImpl("tmp/run_script_\(uuid).py", fileSize: 512),
+                       "36 位命中")
+    }
+
+    /// 非 UUID 字符集不命中（含下划线等非法字符）
+    func testTempScript_uuidCharSet() {
+        let bad = "ZZZZZZZZ-ZZZZ-ZZZZ-ZZZZ-ZZZZZZZZZZZZ"      // 长度对但含非十六进制字母
+        XCTAssertTrue(PyodideBridge.wsIncludedImpl("tmp/run_script_\(bad).py", fileSize: 512))
+        XCTAssertFalse(PyodideBridge.isUUIDTail("not-a-uuid"))
+        XCTAssertFalse(PyodideBridge.isUUIDTail(""))
+    }
+
+    /// 直接断言判定函数（含空串/无后缀/纯文件名等边界）
+    func testIsTempScriptPath_directCases() {
+        XCTAssertTrue(PyodideBridge.isTempScriptPath("tmp/run_script_\(uuid).py"))
+        XCTAssertTrue(PyodideBridge.isTempScriptPath("run_script_\(uuid).sh"))
+        XCTAssertFalse(PyodideBridge.isTempScriptPath(""))
+        XCTAssertFalse(PyodideBridge.isTempScriptPath("tmp/notes.txt"))
+        XCTAssertFalse(PyodideBridge.isTempScriptPath("run_script_\(uuid).txt"),
+                       "只认 .py/.sh 两种后缀")
+    }
+
     // MARK: - 体检页状态分级（WorkspaceSnapshotHealth.Level）
 
     private func makeHealth(
         includedBytes: Int64,
         includedFileCount: Int,
-        overGuard: Bool = false
+        overGuard: Bool = false,
+        lastPayloadBytes: Int = 0,
+        lastUncompressedBytes: Int = 0,
+        skipped: Bool = false
     ) -> WorkspaceSnapshotHealth {
         WorkspaceSnapshotHealth(
             includedFileCount: includedFileCount,
@@ -160,12 +238,17 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
             maxFileCount: 2000,
             folders: [],
             lastInjectionAt: nil,
-            lastInjectionFileCount: 0,
-            lastInjectionPayloadBytes: 0,
-            lastSeedSkipped: false,
+            lastInjectionFileCount: includedFileCount,
+            lastInjectionPayloadBytes: lastPayloadBytes,
+            lastInjectionUncompressedBytes: lastUncompressedBytes,
+            lastSeedSkipped: skipped,
             lastSeedOverGuard: overGuard,
             fingerprintStable: false
         )
+    }
+
+    private func byteText(_ bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .binary)
     }
 
     /// 余量充足 → 健康
@@ -196,5 +279,86 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
                        "文件数破 2000 同样退化")
         XCTAssertEqual(makeHealth(includedBytes: 1, includedFileCount: 1, overGuard: true).level, .overGuard,
                        "上次 seed 已超护栏时，即使当前体积回落也维持退化态提示")
+    }
+
+    // MARK: - 上次注入文案（两段式：原始 → 压缩）
+
+    /// 正常注入：必须同时给出压缩前与压缩后两个数。只给一个是没意义的——
+    /// 压缩比完全取决于 included 集的内容构成，两个数字摆在一起才能看出
+    /// 当前落在「文本为主（压得动）」还是「二进制为主（压不动）」
+    func testLastInjectionVolumeText_normal_isTwoLegged() {
+        let h = makeHealth(
+            includedBytes: 20 * 1024 * 1024,
+            includedFileCount: 599,
+            lastPayloadBytes: 5_500_000,
+            lastUncompressedBytes: 37_000_000
+        )
+        XCTAssertEqual(
+            h.lastInjectionVolumeText,
+            "599 个文件 · 原始 \(byteText(37_000_000)) → 压缩 \(byteText(5_500_000))"
+        )
+    }
+
+    /// skip 分支必须带体积（v4 验收项）。指纹一致是稳态、这一行被看得最多，
+    /// 不带体积等于把最该被观察的状态藏起来——历史上正是这里最先被省掉
+    func testLastInjectionVolumeText_skippedStillCarriesVolume() {
+        let h = makeHealth(
+            includedBytes: 20 * 1024 * 1024,
+            includedFileCount: 599,
+            lastPayloadBytes: 5_500_000,
+            lastUncompressedBytes: 37_000_000,
+            skipped: true
+        )
+        let text = h.lastInjectionVolumeText
+        XCTAssertTrue(text.hasPrefix("指纹一致，零开销跳过"), text)
+        XCTAssertTrue(text.contains(byteText(37_000_000)), "skip 行必须带体积：\(text)")
+        XCTAssertFalse(text.contains("个文件"), "skip 本轮没搬文件，不该报文件数：\(text)")
+    }
+
+    /// 超护栏分支维持原口径（此时没有体积可展示，讲的是降级通道）
+    func testLastInjectionVolumeText_overGuard() {
+        let h = makeHealth(includedBytes: 33 * 1024 * 1024, includedFileCount: 599, overGuard: true)
+        XCTAssertEqual(h.lastInjectionVolumeText, "超护栏放弃注入，MEMFS 退化为隔离态")
+    }
+
+    /// 新字段带默认值：既有构造点（体检页 VC、本文件工厂）不传也能编译。
+    /// memberwise init 对带默认值属性会生成默认参数，但它是 internal 的，
+    /// 公开 struct 跨模块构造必须显式 init——这条用例锁住「扩展不破坏
+    /// 调用方」这个前提。
+    /// review fix：必须**裸调 init 省略新参数**才能真正锁住默认值——
+    /// 走 makeHealth 工厂时新参数被工厂自己的默认值显式填上了，
+    /// 删掉 init 的 `= 0` 该测试也照样通过（防线比声称的弱一档）
+    func testLastInjectionUncompressedBytes_defaultsToZero() {
+        let h = WorkspaceSnapshotHealth(
+            includedFileCount: 1,
+            includedBytes: 1,
+            maxBytes: 32 * 1024 * 1024,
+            maxFileCount: 2000,
+            folders: [],
+            lastInjectionAt: nil,
+            lastInjectionFileCount: 0,
+            lastInjectionPayloadBytes: 0,
+            lastSeedSkipped: false,
+            lastSeedOverGuard: false,
+            fingerprintStable: false
+        )
+        XCTAssertEqual(h.lastInjectionUncompressedBytes, 0)
+    }
+
+    /// 旧 b64 通道删除的回归防线。留着旧变量会让「取数到底走哪条」在排障时
+    /// 多一个分叉，且 Swift 侧已不再写它——JS 侧留分支等于留一段死代码
+    func testHostJs_hasNoLegacyB64Channel() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // Tests/TerrariumTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // 包根
+            .appendingPathComponent("Sources/Terrarium/Resources/pyodide-host/host.js")
+        let text = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertFalse(text.contains("__MS_WS_B64__"), "host.js 不得再出现旧通道变量")
+        XCTAssertTrue(text.contains("__MS_WS_URL__"), "新通道变量必须还在")
+        XCTAssertTrue(text.contains("_msz.decompress(_ws_buf, -15)"),
+                      "仍须用 -15 解裸 DEFLATE（Apple COMPRESSION_ZLIB 无头无校验尾）")
+        XCTAssertTrue(text.contains("raise RuntimeError('ws buffer missing')"),
+                      "buffer 缺失要显式报错，不能退化成静默空解")
     }
 }

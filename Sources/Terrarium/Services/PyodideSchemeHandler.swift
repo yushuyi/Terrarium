@@ -98,6 +98,11 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
             startProxy(task, proxyURL: url)
             return
         }
+        // 工作区快照分支（pyodide-local://ws/snapshot）：内存伺服压缩 Data
+        if url.host == "ws" {
+            startWorkspaceSnapshot(task, url: url)
+            return
+        }
         guard let dirName = url.host.flatMap({ Self.hostToDirectory[$0] }),
               let base = Self.resourceDirectory(dirName),
               let relative = url.path.removingPercentEncoding,
@@ -326,6 +331,50 @@ final class PyodideSchemeHandler: NSObject, WKURLSchemeHandler {
         lock.lock()
         stoppedTasks.remove(ObjectIdentifier(task))
         lock.unlock()
+    }
+
+    // MARK: - 工作区快照（ws host）
+
+    /// `pyodide-local://ws/snapshot` —— 内存伺服工作区快照的压缩 Data。
+    ///
+    /// ⚠️ **CORS 是硬需求**：页面源 `pyodide-local://host` 与
+    /// `pyodide-local://ws` 是不同 host（跨源），响应必须带
+    /// `Access-Control-Allow-Origin: *`。**不能走 `respond()`**（它只设
+    /// `text/plain`、无 ACAO）——net 分支注释记载过「无 ACAO 同步 XHR 被拦成
+    /// status 0」的真机教训。fetch arrayBuffer 对 Content-Type 无要求，
+    /// 但 ACAO 少一个字母都不行。
+    ///
+    /// ⚠️ **缓存防御**：带 `Cache-Control: no-store`。现仓 pyodide-local
+    /// fetch 全是 bootstrap 期一次性；一旦 WebKit 命中内存缓存，MEMFS 会
+    /// 停在旧快照（读旧数据）。
+    private func startWorkspaceSnapshot(_ task: WKURLSchemeTask, url: URL) {
+        guard url.lastPathComponent == "snapshot" else {
+            NSLog("[PyodideSchemeHandler] ws 404: 仅伺服 /snapshot（收到 \(url.path)）")
+            respond(task, status: 404, body: Data("pyodide-local: ws only serves /snapshot".utf8))
+            return
+        }
+        guard let data = PyodideBridge.wsSnapshotProvider?() else {
+            // 明确 404：排障时要能区分「没 seed」与「seed 失败/已重置」，
+            // 静默交付空 Data 会让 host.js 解压空流、报错不可分辨
+            NSLog("[PyodideSchemeHandler] ws 404: 无快照 provider（未 seed 或已随宿主页重载清空）")
+            respond(task, status: 404, body: Data("pyodide-local: ws snapshot unavailable".utf8))
+            return
+        }
+        let response = HTTPURLResponse(
+            url: url,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: [
+                "Content-Type": "application/octet-stream",
+                "Content-Length": "\(data.count)",
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store",
+            ]
+        )!
+        // 必须走 deliver 包装（过滤已 stop 的任务），禁止直接 didReceive
+        deliver(task) { task.didReceive(response) }
+        deliver(task) { task.didReceive(data) }
+        deliver(task) { task.didFinish() }
     }
 
     // MARK: - Helpers

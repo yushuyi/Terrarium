@@ -500,12 +500,22 @@ async function runPython(id, code) {
 
   // 工作区快照恢复（I-4）：Swift 在 run 前注入的 Documents 快照写到
   // MEMFS 容器根绝对路径（HOME 已固化，open 即命中），manifest 落
-  // /persist 供 run 后 diff 收集。幂等：无 b64 时零开销跳过
+  // /persist 供 run 后 diff 收集。幂等：无 payload 时零开销跳过
+  // 唯一通道（步骤 4 起）：Swift 压缩后经 ws scheme 伺服，JS fetch 出
+  // ArrayBuffer，由 wsGlobals 注入 `_ws_buf`（memoryview），须用
+  // zlib.decompress(-15)——Apple COMPRESSION_ZLIB 产出的是裸 DEFLATE/
+  // RFC1951，无 0x78 头、无 adler32 尾，不带 -15 直接抛错
+  // 旧通道（Swift 分块 evaluate 往 JS 全局拼 MB 级 base64 字符串）已在此步
+  // 删除：压缩通道真机验证通过后无回退价值，留着只会让「取数到底走哪条」
+  // 在排障时多一个分叉。旧变量名不再出现在本文件任何可执行语句中
   const WS_RESTORE_SRC = [
-    "import json as _msj, os as _mso, base64 as _msb",
+    "import json as _msj, os as _mso, base64 as _msb, zlib as _msz",
     "_root = __import__('js').window.__MS_DOCROOT__ or ''",
     "if _root:",
-    "    _ws = _msj.loads(__import__('js').window.__MS_WS_B64__ or '[]')",
+    "    if '_ws_buf' not in globals():",
+    "        raise RuntimeError('ws buffer missing')",
+    "    _raw = _msz.decompress(_ws_buf, -15)  # bytes：json.loads 自动探测 UTF-8，省 36MB 瞬态 str",
+    "    _ws = _msj.loads(_raw)",
     "    _keep = set(e['p'] for e in _ws)",
     "    _docs = _mso.path.join(_root, 'Documents')",
     "    if _mso.path.isdir(_docs):",
@@ -528,7 +538,9 @@ async function runPython(id, code) {
     "            _mf[_e['p']] = [_st.st_size, int(_st.st_mtime)]",
     "        except OSError: pass",
     "    _msj.dump(_mf, open('/persist/.ms_ws_manifest.json', 'w'))",
-    "__import__('js').window.__MS_WS_B64__ = None",
+    // 承重墙：URL 必须清。漏清会让 auto-install 重跑（host.js 尾部）
+    // 二次 restore，把首轮已删的文件复活
+    "__import__('js').window.__MS_WS_URL__ = None",
   ].join("\n");
   // 工作区收集（I-4）：对比注入 manifest 与当前 MEMFS 容器根子树，
   // 新增/变更/删除打包回传；manifest 更新为当前状态供下次 diff。
@@ -561,19 +573,40 @@ async function runPython(id, code) {
 
   const runUser = async () => {
     // 工作区快照恢复须在一切用户可见执行之前
-    if (window.__MS_WS_B64__) {
+    if (window.__MS_WS_URL__) {
+      // 新通道（压缩 + ws scheme 伺服）：evaluate 只传了 URL，真正的载荷
+      // 由 fetch 走 SchemeHandler 拿，不再有 MB 级 JS 大字符串
+      const wsGlobals = pyodide.toPy({});
+      let wsBuf = null;
       try {
-        // 独立 globals（review m6）：临时变量不落用户命名空间
-        const wsGlobals = pyodide.toPy({});
-        try { await pyodide.runPythonAsync(WS_RESTORE_SRC, { globals: wsGlobals }); }
-        finally { wsGlobals.destroy(); }
+        const resp = await fetch(window.__MS_WS_URL__);
+        // 陷阱四：provider 404 等必须暴露成错误而非静默空解
+        if (!resp.ok) throw new Error("ws snapshot fetch status " + resp.status);
+        const u8 = new Uint8Array(await resp.arrayBuffer());
+        // buffer 不走 evaluate 传：经 toPy 注入独立 globals，
+        // WS_RESTORE_SRC 就跑在 wsGlobals 里，不污染用户命名空间
+        wsBuf = pyodide.toPy(u8);
+        wsGlobals.set("_ws_buf", wsBuf);
+        await pyodide.runPythonAsync(WS_RESTORE_SRC, { globals: wsGlobals });
         // 对账会删 MEMFS 空目录，/tmp symlink 的目标必须在此后重建
         if (window.__MS_DOCROOT__) {
           try { pyodide.FS.mkdirTree(window.__MS_DOCROOT__ + "/Documents/tmp"); }
           catch (e) { console.warn("[pyodide] /tmp 目标目录重建失败:", e); }
         }
         window.__MS_WS_READY__ = true;
-      } catch (e) { console.warn("[pyodide] 工作区恢复失败:", e); }
+      } catch (e) {
+        // v4 改判：只置 READY=false + warn——**不重置 manifest、不置 SKIPPED**。
+        // manifest 住 MEMFS、与内容天然一致；在失败轮重置它，会让下一轮
+        // collect 把整棵树判成「新增」→ 26.8MB 级全量写回风暴
+        console.warn("[pyodide] 工作区恢复失败（ws 通道）:", e);
+        window.__MS_WS_READY__ = false;
+      } finally {
+        window.__MS_WS_URL__ = null;
+        // PyProxy 双销毁（v3）：_ws_buf 是 26.8MB 级 memoryview，
+        // 只销毁 wsGlobals 不销毁 buf 等于每轮泄漏、直顶 jetsam
+        if (wsBuf) { try { wsBuf.destroy(); } catch (_) {} }
+        try { wsGlobals.destroy(); } catch (_) {}
+      }
     } else if (window.__MS_DOCROOT__ && window.__MS_WS_SKIPPED__) {
       // 跳过≠可疑（2026-10-11 超护栏事故收尾）：护栏主动跳过注入时，
       // Documents 写入通道降级为「MEMFS 白纸 + 轮末收集回写」而非熔断——
