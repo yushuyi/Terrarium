@@ -148,6 +148,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
             loadError = "无法构造 pyodide-local scheme URL（PyodideSchemeHandler.scheme 异常）"
             return
         }
+        // 重置入口：丢弃上一轮的压缩快照（宿主页重载后残留 Data 会被下一轮
+        // fetch 取走，MEMFS 停在旧快照——这也是回收约 5.5MB 常驻内存的时机）
+        Self.wsSnapshotProvider = nil
         webView.load(URLRequest(url: url))
         seedPersistMirror()
     }
@@ -598,6 +601,22 @@ public final class PyodideBridge: NSObject, ObservableObject {
         guard outSize > 0, outSize <= decompressedSize else { return nil }
         return Data(dst[0..<outSize])
     }
+
+    // MARK: - ws 伺服 provider（pyodide-local://ws/snapshot 的数据源）
+
+    /// 工作区快照压缩数据提供者。seedWorkspaceMirror 压缩完成后设置，
+    /// `PyodideSchemeHandler` 的 ws 分支按请求读取（内存伺服，不落 Caches）。
+    ///
+    /// ⚠️ `nonisolated(unsafe)` 是编译必需：handler 的协议回调
+    /// `webView(_:start:)` 是非隔离上下文，而本类 @MainActor，static var
+    /// 不加此修饰编译不过。**约束（务必遵守）：仅主线程读写**——scheme 回调
+    /// 与 bridge 同在主线程（WebKit 回调线程 = 主线程，@MainActor 保证），
+    /// 压缩在 `Task.detached` 内完成、回主线程后再赋值。
+    ///
+    /// 清理由 `loadHostPage()` 统一负责（handleWebContentTerminated 与
+    /// scheduleTimeout 两条重置路径都经过它）——漏清会让下一轮 fetch 拿到
+    /// 上一轮的陈旧快照。
+    nonisolated(unsafe) static var wsSnapshotProvider: (() -> Data?)?
 
     private nonisolated static func packSnapshotEntries() -> ([[String: String]], String)? {
         let fm = FileManager.default
