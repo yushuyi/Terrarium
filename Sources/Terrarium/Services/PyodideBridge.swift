@@ -736,10 +736,14 @@ public final class PyodideBridge: NSObject, ObservableObject {
         return parts.joined(separator: "\u{1F}")
     }
 
-    /// 二期按需注入开关（方案步骤 F）：默认**关**——关闭时注入/指纹/打包
-    /// 全部走全量口径，行为与主干逐字节一致；回滚 = 关开关
+    /// 二期按需注入开关：默认**开**（2026-10-15 决策：项目未上线，跳过灰度
+    /// 观察期直接全量上线；真机 A–E 步骤 + canary 批次已充分验收）。
+    /// 关开关 = 回滚到全量注入，无数据迁移、无状态残留。
+    /// 补漏治理走日志驱动：补漏发生时 `[Pyodide]` 日志点名缺失文件，
+    /// 学习缓存按「脚本哈希 → 缺失清单」自动攒案例，用于持续完善
+    /// 预测（path_hints）与清单（planner）两层。
     nonisolated static var predictiveEnabled: Bool {
-        UserDefaults.standard.object(forKey: "pyodide.workspace.predictive.enabled") as? Bool ?? false
+        UserDefaults.standard.object(forKey: "pyodide.workspace.predictive.enabled") as? Bool ?? true
     }
 
     /// run 前调用：宿主 Documents 快照注入 MEMFS。
