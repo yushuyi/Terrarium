@@ -448,6 +448,11 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 上次注入的 Documents 指纹（相对路径|大小|mtime 稳定排序拼接）。
     /// 收集写回后更新——宿主与 MEMFS 一致期间跳过重复注入。
     private var wsLastFingerprint: String?
+    /// 上次实际注入的集合（二期按需注入，审查 P2-1 单一基准）：
+    /// 全量注入为 nil；写回后的指纹重算与体检页 stable 判定均以它为
+    /// 基准——集合外文件变化天然不影响命中（强约束：漏改任一处会让
+    /// 写过文件的命令重跑同命令时全量重注入、指纹恒不稳定）
+    private var wsLastInjectionSet: Set<String>?
     /// 当前页面已注入标志（页面重载后 JS 变量清空，须与指纹双重判断）
     private var wsInjectedIntoCurrentPage = false
     /// 最近一次注入记录（仅进程内，供 DEBUG「Pyodide 运行时体检」页展示）
@@ -626,13 +631,29 @@ public final class PyodideBridge: NSObject, ObservableObject {
 
     /// 产物直接给 JSON `Data`（压缩通道的输入）——原先产 String 再转 utf8
     /// 会多一次 36.7MB 全量拷贝，是 Swift 侧内存峰值的大头之一
-    private nonisolated static func packSnapshotEntries() -> ([[String: String]], Data)? {
+    /// - Parameter set: 二期按需口径（nil = 全量遍历，现行行为）。非 nil 时
+    ///   按注入集逐文件读取，不枚举整树；集合内文件缺失/被排除则跳过
+    ///   （指纹层已先做存在性校验，正常到不了）
+    private nonisolated static func packSnapshotEntries(set: Set<String>? = nil) -> ([[String: String]], Data)? {
         let fm = FileManager.default
         let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        var entries: [[String: String]] = []
+        if let set {
+            let docsPath = docs.standardizedFileURL.path
+            for rel in set.sorted() {
+                let url = URL(fileURLWithPath: docsPath + "/" + rel)
+                guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                      values.isRegularFile == true else { continue }
+                guard wsIncludedImpl(rel, fileSize: values.fileSize ?? 0),
+                      let data = try? Data(contentsOf: url) else { continue }
+                entries.append(["p": "Documents/" + rel, "d": data.base64EncodedString()])
+            }
+            guard let payloadData = try? JSONSerialization.data(withJSONObject: entries) else { return nil }
+            return (entries, payloadData)
+        }
         guard let enumerator = fm.enumerator(at: docs, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]) else {
             return nil
         }
-        var entries: [[String: String]] = []
         for case let url as URL in enumerator {
             guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
                   values.isRegularFile == true else { continue }
@@ -649,30 +670,63 @@ public final class PyodideBridge: NSObject, ObservableObject {
     }
 
     /// Documents 递归指纹。返回 nil 表示超护栏或枚举失败（不启用快照桥）。
-    private func documentsFingerprint() -> String? {
+    /// - Parameter set: 二期按需口径（nil = 全量遍历，现行行为）。非 nil 时
+    ///   只统计集合内文件（逐个 stat，不枚举整树）；集合内有文件被删/
+    ///   落入排除集/超护栏 → 返回 nil（调用方回退全量）
+    private func documentsFingerprint(set: Set<String>? = nil) -> String? {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return Self.documentsFingerprintImpl(docs: docs, set: set)
+    }
+
+    /// static 形态供单测注入临时目录（实例方法受主 actor 隔离，同
+    /// wsRelativePathImpl 的拆分理由）。
+    nonisolated static func documentsFingerprintImpl(docs: URL, set: Set<String>?) -> String? {
         let fm = FileManager.default
-        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        var parts: [String] = []
+        var totalSize = 0
+        var count = 0
+        if let set {
+            let docsPath = docs.standardizedFileURL.path
+            // 集合排序遍历：指纹串与全量口径同构（rel|size|mtime 有序拼接）
+            for rel in set.sorted() {
+                let url = URL(fileURLWithPath: docsPath + "/" + rel)
+                guard let values = try? url.resourceValues(
+                    forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
+                    values.isRegularFile == true else { return nil }
+                let size = values.fileSize ?? 0
+                guard wsIncludedImpl(rel, fileSize: size) else { return nil }
+                let mtime = Int((values.contentModificationDate ?? Date()).timeIntervalSince1970)
+                parts.append("\(rel)|\(size)|\(mtime)")
+                count += 1
+                totalSize += size
+                if totalSize > wsMaxTotalBytes || count > wsMaxFileCount { return nil }
+            }
+            return parts.joined(separator: "\u{1F}")
+        }
         guard let enumerator = fm.enumerator(
             at: docs,
             includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
         ) else { return nil }
-        var parts: [String] = []
-        var totalSize = 0
-        var count = 0
         for case let url as URL in enumerator {
             guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
                   values.isRegularFile == true else { continue }
-            guard let rel = wsRelativePath(url, docs: docs) else { continue }
+            guard let rel = wsRelativePathImpl(url, docs: docs) else { continue }
             let size = values.fileSize ?? 0
-            guard wsIncluded(rel, fileSize: size) else { continue }
+            guard wsIncludedImpl(rel, fileSize: size) else { continue }
             let mtime = Int((values.contentModificationDate ?? Date()).timeIntervalSince1970)
             parts.append("\(rel)|\(size)|\(mtime)")
             count += 1
             totalSize += size
-            if totalSize > Self.wsMaxTotalBytes || count > Self.wsMaxFileCount { return nil }
+            if totalSize > wsMaxTotalBytes || count > wsMaxFileCount { return nil }
         }
         parts.sort()
         return parts.joined(separator: "\u{1F}")
+    }
+
+    /// 二期按需注入开关（方案步骤 F）：默认**关**——关闭时注入/指纹/打包
+    /// 全部走全量口径，行为与主干逐字节一致；回滚 = 关开关
+    nonisolated static var predictiveEnabled: Bool {
+        UserDefaults.standard.object(forKey: "pyodide.workspace.predictive.enabled") as? Bool ?? false
     }
 
     /// run 前调用：宿主 Documents 快照注入 MEMFS。
@@ -680,7 +734,11 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 由 ws scheme 在内存里伺服；Swift 侧只 evaluate 一个 URL 字符串，
     /// host.js 的 runUser 开头 fetch + 解压 + restore 再跑用户代码。
     /// 指纹与页面标志双重判断，宿主未变且 MEMFS 仍持有快照时零开销跳过。
-    func seedWorkspaceMirror() async -> String {
+    ///
+    /// - Parameter injectionSet: 二期按需注入集（nil = 全量口径）。生效条件
+    ///   = 开关开启且非 nil；任何回退分支（提取失败/超限/集合探测失败）
+    ///   统一落全量主体，「永不比现状差」
+    func seedWorkspaceMirror(injectionSet: Set<String>? = nil) async -> String {
         // 必须让 JS 返回 String：boolean 会被 evaluate 的 as? String 丢弃
         let readyOnPage = await evaluate("String(window.__MS_WS_READY__ === true)")
         // 页面标志是 window 变量，pyodide 实例重建后仍可能遗留 true 而
@@ -692,9 +750,19 @@ public final class PyodideBridge: NSObject, ObservableObject {
             wsInjectedIntoCurrentPage = false
             wsLastFingerprint = nil
         }
+        // 开关语义（§3.4）：activeSet 非 nil 才走按需口径；指纹/打包/写回
+        // 三处以它为同一基准（P2-1 单一基准约束）
+        var activeSet: Set<String>? = (Self.predictiveEnabled && injectionSet != nil) ? injectionSet : nil
+        if activeSet != nil, documentsFingerprint(set: activeSet) == nil {
+            // 注入集探测失败（文件被删/落排除集/超护栏——预测与实况的
+            // 竞态窗口）→ 回退全量；不引入新的失败模式
+            AppLog.log("[Pyodide] 注入集探测失败（缺失/超限），回退全量注入",
+                   log: Log.pyodide)
+            activeSet = nil
+        }
         if wsInjectedIntoCurrentPage,
            let fp = wsLastFingerprint,
-           fp == documentsFingerprint() {
+           fp == documentsFingerprint(set: activeSet) {
             // 沿用上次的体积（本轮没搬任何字节）：体检页 skip 行据此展示
             // 「上次注入的实际量级」，否则稳态下最常被看到的那行反而最没信息
             recordSeed(at: Date(), fileCount: wsLastInjectionFileCount,
@@ -703,7 +771,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
                        skipped: true, overGuard: false)
             return "" // MEMFS 与宿主一致，零开销跳过
         }
-        guard let fingerprint = documentsFingerprint() else {
+        // activeSet 非 nil 时到不了这（上方探测失败已回退全量）；此处 nil
+        // 只能是全量口径超护栏 → 现行 SKIPPED 降级（host.js 白纸 + 回写）
+        guard let fingerprint = documentsFingerprint(set: activeSet) else {
             AppLog.log("[Pyodide] 工作区快照跳过：Documents 超护栏（>32MB 或 >2000 文件）",
                    log: Log.pyodide)
             recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, uncompressedBytes: 0,
@@ -713,7 +783,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
             return ""
         }
         let packed = await Task.detached(priority: .userInitiated) {
-            Self.packSnapshotEntries()
+            Self.packSnapshotEntries(set: activeSet)
         }.value
         guard let (entries, payloadData) = packed else {
             recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, uncompressedBytes: 0,
@@ -760,14 +830,16 @@ public final class PyodideBridge: NSObject, ObservableObject {
             return ""
         }
         wsLastFingerprint = fingerprint
+        wsLastInjectionSet = activeSet // P2-1 单一基准：写回重算/stable 判定同源
         wsInjectedIntoCurrentPage = true
         recordSeed(at: Date(), fileCount: entries.count, payloadBytes: compressed.count,
                    uncompressedBytes: payloadData.count,
                    skipped: false, overGuard: false)
         // 注入成功即清除跳过标记：同页后续 run 的告警语义回到 ready 口径
         _ = await evaluate("window.__MS_WS_SKIPPED__ = false; 'ok'")
-        AppLog.log("[Pyodide] 工作区快照注入完成 文件数=%{public}ld 原始=%{public}ld 字节 压缩后=%{public}ld 字节",
-               log: Log.pyodide, Int32(entries.count), Int32(payloadData.count), Int32(compressed.count))
+        AppLog.log("[Pyodide] 工作区快照注入完成 模式=%{public}@ 文件数=%{public}ld 原始=%{public}ld 字节 压缩后=%{public}ld 字节",
+               log: Log.pyodide, activeSet != nil ? "按需" : "全量",
+               Int32(entries.count), Int32(payloadData.count), Int32(compressed.count))
         return ""
     }
 
@@ -853,7 +925,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
         let stats = await Task.detached(priority: .userInitiated) {
             Self.workspaceFolderStats()
         }.value
-        let current = documentsFingerprint()
+        // stable 判定基准 = 上次注入集（P2-1，与写回重算同源）；included
+        // 全量统计口径保留（护栏重校的数据源仍是它，§六 #2）
+        let current = documentsFingerprint(set: wsLastInjectionSet)
         let stable: Bool
         if wsInjectedIntoCurrentPage, let fp = wsLastFingerprint {
             stable = (fp == current)
@@ -898,8 +972,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
             await MainActor.run { [weak self] in
                 guard let self else { done(); return }
                 // 宿主已与 MEMFS 对齐：以写回后的宿主状态重算指纹。
-                // 任一写/删失败（review m4）则不置注入标志，下轮重注入自愈
-                self.wsLastFingerprint = self.documentsFingerprint()
+                // 任一写/删失败（review m4）则不置注入标志，下轮重注入自愈。
+                // 指纹口径 = 上次注入集（P2-1）：按需模式下集合外文件变化
+                // 天然不影响命中——漏改此处会让写过文件的命令每次全量重注入
+                self.wsLastFingerprint = self.documentsFingerprint(set: self.wsLastInjectionSet)
                 self.wsInjectedIntoCurrentPage = !result.failed
                 if result.applied > 0 {
                     AppLog.log("[Pyodide] 工作区收集写回 %{public}ld 个文件", log: Log.pyodide, Int32(result.applied))
@@ -965,6 +1041,14 @@ public final class PyodideBridge: NSObject, ObservableObject {
 
     // MARK: Run code
 
+    /// 注入集预测（二期步骤 B）：委托 WorkspaceInjectionPlanner，docs 路径
+    /// 在此解析（planner 保持纯函数可测）。返回 nil = 回退全量
+    private nonisolated static func planInjectionSet(argv: [String]?, pathHints: [String]?) -> Set<String>? {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        return WorkspaceInjectionPlanner.plan(
+            argv: argv, pathHints: pathHints, docsPath: docs.standardizedFileURL.path)
+    }
+
     public func runPython(code: String) async -> PyodideRunResult {
         await runPython(code: code, onOutput: nil, timeout: nil)
     }
@@ -972,15 +1056,16 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 执行 Python 代码。
     /// - Parameters:
     ///   - workspaceArgv: dispatcher 信号 JSON 顶层透传的完整命令行参数
-    ///     （二期按需注入的注入集提取源）。步骤 A 管道验收锚点：仅日志
-    ///     打印，seedWorkspaceMirror 暂不消费——注入集语义步骤 B 由
-    ///     WorkspaceInjectionPlanner 接管（二期方案 §3.1）。默认 nil。
+    ///     （[prog] + sys.argv[1:]，argv[0] 为脚本路径/-c）
+    ///   - workspacePathHints: dispatcher 两层扫描归一后的绝对路径候选
+    ///     （二期按需注入的字面量提示层，cwd 已在 dispatcher 侧解析）
     ///   - onOutput: 逐行输出回调（stdout/stderr 流式），行到达即触发
     ///   - timeout: 超时秒数；超时后重载宿主页（JS 死循环无法从外部
     ///     中断，进程级重置是唯一可靠杀法），并以超时错误完成本次调用
     public func runPython(
         code: String,
         workspaceArgv: [String]? = nil,
+        workspacePathHints: [String]? = nil,
         onOutput: ((PyodideOutputLine) -> Void)?,
         timeout: TimeInterval?
     ) async -> PyodideRunResult {
@@ -995,7 +1080,14 @@ public final class PyodideBridge: NSObject, ObservableObject {
                    log: Log.pyodide, Int32(workspaceArgv.count),
                    String(workspaceArgv.joined(separator: " ").prefix(400)))
         }
-        await seedWorkspaceMirror() // I-4：Documents 快照注入（指纹一致时零开销跳过）
+        // 注入集预测（二期步骤 B，方案 §三）：开关开启且有管道输入时计算。
+        // 开关关闭零参与（连 planner 都不跑）；planner 返回 nil（提取失败/
+        // 超限/脚本定位失败）→ seedWorkspaceMirror 落全量口径
+        let injectionSet: Set<String>? =
+            (Self.predictiveEnabled && (workspaceArgv != nil || workspacePathHints != nil))
+            ? Self.planInjectionSet(argv: workspaceArgv, pathHints: workspacePathHints)
+            : nil
+        await seedWorkspaceMirror(injectionSet: injectionSet) // I-4：快照注入（指纹一致时零开销跳过）
         // seed 途中进程死亡兜底（review P1-1）：jetsam 最高发窗口恰是快照
         // 注入本身，此刻本调用尚未进 pendingRun，死亡回调够不到它。若放行，
         // park 后的 evaluate 落在进程重生/未 commit 窗口时 completionHandler
