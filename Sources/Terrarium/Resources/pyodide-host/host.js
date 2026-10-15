@@ -760,17 +760,24 @@ if _n:
       exception = null;
     }
   } finally {
-    // 工作区收集：用户 code 抛异常也可能写过文件，成功失败都要收集
-    const wsGlobals = pyodide.toPy({});
-    try {
-      await pyodide.runPythonAsync(WS_COLLECT_SRC, { globals: wsGlobals });
-    } catch (e) {
-      console.warn("[pyodide] 工作区收集失败:", e);
-      window.__MS_WS_READY__ = false; // 收集失效即快照链路可疑，下轮强制重注入
-    } finally {
-      wsGlobals.destroy();
+    // 三期步骤 B（P1-3）：pip 旁路（Swift 侧 argv/pathHints 双 nil 时置
+    // __MS_WS_BYPASS__）整环跳过收集——通道内未 seed、MEMFS 与宿主无需
+    // 对账，跑完 Swift 侧会清标志
+    if (window.__MS_WS_BYPASS__) {
+      currentRunId = null;
+    } else {
+      // 工作区收集：用户 code 抛异常也可能写过文件，成功失败都要收集
+      const wsGlobals = pyodide.toPy({});
+      try {
+        await pyodide.runPythonAsync(WS_COLLECT_SRC, { globals: wsGlobals });
+      } catch (e) {
+        console.warn("[pyodide] 工作区收集失败:", e);
+        window.__MS_WS_READY__ = false; // 收集失效即快照链路可疑，下轮强制重注入
+      } finally {
+        wsGlobals.destroy();
+      }
+      currentRunId = null;
     }
-    currentRunId = null;
   }
   const durationMs = Math.round(performance.now() - t0);
   post({

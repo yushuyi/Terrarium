@@ -1253,7 +1253,9 @@ public final class PyodideBridge: NSObject, ObservableObject {
     }
 
     public func runPython(code: String) async -> PyodideRunResult {
-        await runPython(code: code, onOutput: nil, timeout: nil)
+        // 三期步骤 C：便捷入口无调用方传 timeout（原 nil = 无兜底可锁死），
+        // 补 300s 硬顶默认值
+        await runPython(code: code, onOutput: nil, timeout: 300)
     }
 
     /// 执行 Python 代码。
@@ -1295,7 +1297,14 @@ public final class PyodideBridge: NSObject, ObservableObject {
         if let base = injectionSet {
             injectionSet = Self.mergedWithLearned(code: code, base: base, docsPath: docsPath)
         }
+        // 三期步骤 B（P1-3）：argv/pathHints 双 nil = pip 通道（PythonBridge.m
+        // pip 壳 handler(code, nil, nil, nil)）→ 工作区旁路。装包不需要
+        // 工作区文件，跳过整个 seed/restore/collect 环（体检实证每次装包
+        // 白搬全量 22.8MB）；不 touch MEMFS/manifest，上轮注入状态原样
+        // 保留，下一条正常命令指纹照常判定
+        let bypassWorkspace = (workspaceArgv == nil && workspacePathHints == nil)
         var result = await runOnce(code: code, injectionSet: injectionSet,
+                                   bypassWorkspace: bypassWorkspace,
                                    onOutput: onOutput, timeout: timeout)
         // 补漏循环（二期步骤 C，§4.1）：仅在按需注入路径生效——全量模式
         // （回退/开关关）下 MEMFS 已含全部 included，FN 只能来自「宿主也
@@ -1343,6 +1352,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 AppLog.log("[Pyodide] 补漏第 %{public}ld 轮：%{public}@ → +%{public}ld 文件重跑",
                        log: Log.pyodide, Int32(round), missingRel, Int32(expanded.added.count))
                 result = await runOnce(code: code, injectionSet: activeSet,
+                                       bypassWorkspace: bypassWorkspace,
                                        onOutput: onOutput, timeout: timeout)
             }
             // 学习记账（§4.5）：补漏轮重跑收敛（exit 0）才记；两轮仍失败
@@ -1358,9 +1368,18 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// attempt 独立 id（outputHandlers/pendingRun 按 id 生命周期，runResult
     /// 时自动清理）；补漏轮 seed 用扩充集，指纹不一致自动重注入。
     private func runOnce(code: String, injectionSet: Set<String>?,
+                         bypassWorkspace: Bool = false,
                          onOutput: ((PyodideOutputLine) -> Void)?,
                          timeout: TimeInterval?) async -> PyodideRunResult {
-        await seedWorkspaceMirror(injectionSet: injectionSet)
+        if bypassWorkspace {
+            // 三期步骤 B（P1-3）：工作区旁路。restore 由「不设 __MS_WS_URL__」
+            // 自然跳过；collect 由 host.js finally 检查 __MS_WS_BYPASS__ 跳过
+            // （collect 原本无条件执行，见 host.js runUser finally 段）。
+            // 跑完即清标志，下一条正常命令不受影响
+            _ = await evaluate("window.__MS_WS_BYPASS__ = true; 'ok'")
+        } else {
+            _ = await seedWorkspaceMirror(injectionSet: injectionSet)
+        }
         // seed 途中进程死亡兜底（review P1-1）：jetsam 最高发窗口恰是快照
         // 注入本身，此刻本调用尚未进 pendingRun，死亡回调够不到它。若放行，
         // park 后的 evaluate 落在进程重生/未 commit 窗口时 completionHandler
@@ -1374,12 +1393,18 @@ public final class PyodideBridge: NSObject, ObservableObject {
         let id = UUID().uuidString
         if let onOutput { outputHandlers[id] = onOutput }
         ensureWebAttached() // window 就绪晚于 bridge 初始化的场景兜底
-        return await withCheckedContinuation { (cont: CheckedContinuation<PyodideRunResult, Never>) in
+        let result = await withCheckedContinuation { (cont: CheckedContinuation<PyodideRunResult, Never>) in
             pendingRun[id] = cont
             let escaped = Self.jsStringLiteral(code)
             webView.evaluateJavaScript("window.terrariumRunPython(\(Self.jsStringLiteral(id)), \(escaped));", completionHandler: nil)
             if let timeout { scheduleTimeout(id: id, timeout: timeout) }
         }
+        if bypassWorkspace {
+            // 跑完即清旁路标志（含失败路径——result 已回）；若中途走了
+            // scheduleTimeout 复位，页面已重载、标志随 JS 上下文消失
+            _ = await evaluate("window.__MS_WS_BYPASS__ = false; 'ok'")
+        }
+        return result
     }
 
     /// 超时兜底：到点仍未回结果 → 清理该次调用的状态并重载宿主页。
