@@ -1376,6 +1376,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
             // 自然跳过；collect 由 host.js finally 检查 __MS_WS_BYPASS__ 跳过
             // （collect 原本无条件执行，见 host.js runUser finally 段）。
             // 跑完即清标志，下一条正常命令不受影响
+            AppLog.log("[Pyodide] 工作区旁路（pip 通道）：跳过工作区注入与收集",
+                   log: Log.pyodide)
             _ = await evaluate("window.__MS_WS_BYPASS__ = true; 'ok'")
         } else {
             _ = await seedWorkspaceMirror(injectionSet: injectionSet)
