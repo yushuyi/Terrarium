@@ -971,11 +971,16 @@ public final class PyodideBridge: NSObject, ObservableObject {
 
     /// 执行 Python 代码。
     /// - Parameters:
+    ///   - workspaceArgv: dispatcher 信号 JSON 顶层透传的完整命令行参数
+    ///     （二期按需注入的注入集提取源）。步骤 A 管道验收锚点：仅日志
+    ///     打印，seedWorkspaceMirror 暂不消费——注入集语义步骤 B 由
+    ///     WorkspaceInjectionPlanner 接管（二期方案 §3.1）。默认 nil。
     ///   - onOutput: 逐行输出回调（stdout/stderr 流式），行到达即触发
     ///   - timeout: 超时秒数；超时后重载宿主页（JS 死循环无法从外部
     ///     中断，进程级重置是唯一可靠杀法），并以超时错误完成本次调用
     public func runPython(
         code: String,
+        workspaceArgv: [String]? = nil,
         onOutput: ((PyodideOutputLine) -> Void)?,
         timeout: TimeInterval?
     ) async -> PyodideRunResult {
@@ -985,6 +990,11 @@ public final class PyodideBridge: NSObject, ObservableObject {
                                     exception: nil, exitCode: -1, durationMs: 0)
         }
         let id = UUID().uuidString
+        if let workspaceArgv, !workspaceArgv.isEmpty {
+            AppLog.log("[Pyodide] workspaceArgv 透传 (%{public}ld 项): %{public}@",
+                   log: Log.pyodide, Int32(workspaceArgv.count),
+                   String(workspaceArgv.joined(separator: " ").prefix(400)))
+        }
         await seedWorkspaceMirror() // I-4：Documents 快照注入（指纹一致时零开销跳过）
         // seed 途中进程死亡兜底（review P1-1）：jetsam 最高发窗口恰是快照
         // 注入本身，此刻本调用尚未进 pendingRun，死亡回调够不到它。若放行，
