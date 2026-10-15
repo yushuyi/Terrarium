@@ -169,6 +169,41 @@ final class WorkspaceInjectionPlannerTests: XCTestCase {
         XCTAssertEqual(set, ["s.py", "data/x.csv"])
     }
 
+    // MARK: - glob 模式串（2026-10-15 收口：内嵌目录前缀收编）
+
+    func testPathHint_globInlinePattern_collectsDirectoryTree() throws {
+        // glob('data/*.csv') 最常见写法：模式串本体探测必然失败，
+        // 截尾后的目录前缀整树收编（此前整条 hint 被丢弃 → 补漏）
+        try write("s.py")
+        try write("data/glob/a.csv")
+        try write("data/glob/sub/b.json")
+        let set = try XCTUnwrap(plan(
+            argv: [docsPath + "/s.py"],
+            pathHints: [docsPath + "/data/*.csv"]))
+        XCTAssertEqual(set, ["s.py", "data/glob/a.csv", "data/glob/sub/b.json"])
+    }
+
+    func testPathHint_globCharClass_prefixBeforeBracket() throws {
+        // "data/202[3-9]/*.csv"：首个通配符在 [，取其前最近目录层
+        try write("s.py")
+        try write("data/2023/y.csv")
+        let set = try XCTUnwrap(plan(
+            argv: [docsPath + "/s.py"],
+            pathHints: [docsPath + "/data/202[3-9]/*.csv"]))
+        XCTAssertTrue(set.contains("data/2023/y.csv"))
+    }
+
+    func testPathHint_bareWildcard_noDirectoryPrefix() throws {
+        // "*.csv" 通配前无目录 → 不收编（交补漏兜底），且不退化为全量。
+        // 夹具放子目录：根散常驻会收根级 <256KB 散文件，会污染断言
+        try write("s.py")
+        try write("sub/x.csv")
+        let set = try XCTUnwrap(plan(
+            argv: [docsPath + "/s.py"],
+            pathHints: [docsPath + "/*.csv"]))
+        XCTAssertEqual(set, ["s.py"])
+    }
+
     // MARK: - 临时脚本与排除目录
 
     func testTempScriptExcluded_butTmpTreeCollected() throws {

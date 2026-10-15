@@ -71,15 +71,20 @@ enum WorkspaceInjectionPlanner {
                                      fm: fm, into: &acc)
 
             // ── ② pathHints 收编（§3.3）：一律不当真，存在性探测后才收 ──
-            // 误报代价收敛为几次 stat；不存在的输出文件名自动出局
+            // 误报代价收敛为几次 stat；不存在的输出文件名自动出局。
+            // glob 模式串（"data/*.csv"）本体探测必然失败——截掉首个通配
+            // 符起尾段，对目录前缀整树收编（2026-10-15 收口，宁多勿漏）
             for hint in pathHints ?? [] {
                 guard let rel = documentsRel(hint, docsPath: docsPath) else { continue }
                 var isDir: ObjCBool = false
-                guard fm.fileExists(atPath: docsPath + "/" + rel, isDirectory: &isDir) else { continue }
-                if isDir.boolValue {
-                    try collectDirectory(rel, docsPath: docsPath, fm: fm, into: &acc)
-                } else {
-                    try collectFile(rel, docsPath: docsPath, fm: fm, into: &acc)
+                if fm.fileExists(atPath: docsPath + "/" + rel, isDirectory: &isDir) {
+                    if isDir.boolValue {
+                        try collectDirectory(rel, docsPath: docsPath, fm: fm, into: &acc)
+                    } else {
+                        try collectFile(rel, docsPath: docsPath, fm: fm, into: &acc)
+                    }
+                } else if let dirRel = globDirectoryPrefix(rel) {
+                    try collectDirectory(dirRel, docsPath: docsPath, fm: fm, into: &acc)
                 }
             }
 
@@ -122,6 +127,18 @@ enum WorkspaceInjectionPlanner {
         let comps = t.split(separator: "/").map(String.init)
         guard !comps.contains(".."), !comps.contains(".") else { return nil }
         return t
+    }
+
+    /// glob 模式串 → 目录前缀（首个 `*`/`?`/`[` 起的尾段截掉）。
+    /// "data/*.csv" → "data"；"data/202[3-9]/*.csv" → "data"（宁多勿漏，
+    /// 字符类前的层级整树收编）；无通配或通配前无目录（"*.csv"）→ nil，
+    /// 交补漏兜底。模式串本体探测必然失败，此助手是它唯一的收编通道。
+    nonisolated static func globDirectoryPrefix(_ rel: String) -> String? {
+        guard let firstWild = rel.firstIndex(where: { "*?[".contains($0) }) else { return nil }
+        let prefix = rel[rel.startIndex..<firstWild]
+        guard let lastSlash = prefix.lastIndex(of: "/"), lastSlash > rel.startIndex else { return nil }
+        let dir = String(prefix[rel.startIndex..<lastSlash])
+        return dir.isEmpty ? nil : dir
     }
 
     // MARK: - 收集器
