@@ -668,7 +668,10 @@ async function runPython(id, code) {
       const STDLIB_SKIP = new Set([
         "webbrowser", "ctypes", "multiprocessing", "tkinter", "curses",
         "distutils", "ensurepip", "venv", "subprocess", "pty", "tty",
-        "readline", "sqlite3.test", "test",
+        "readline", "sqlite3", "sqlite3.test", "test",
+        // sqlite3：只走离线 bundle（lockfile wheel）。防 bundle 回退时
+        // micropip 从 PyPI 装同名假包 → 装完仍 Load failed 的循环
+        // （2026-10-15 三期步骤 D 真机实测现场）
       ]);
       const modName = missing ? missing[2] : null;
       const rootName = modName ? modName.split(".")[0] : null;
@@ -762,8 +765,10 @@ if _n:
   } finally {
     // 三期步骤 B（P1-3）：pip 旁路（Swift 侧 argv/pathHints 双 nil 时置
     // __MS_WS_BYPASS__）整环跳过收集——通道内未 seed、MEMFS 与宿主无需
-    // 对账，跑完 Swift 侧会清标志
+    // 对账。用完即自清：不依赖 Swift 侧清除 evaluate（有 1s 静默兜底，
+    // 失败则标志残留会误跳下一条正常命令的 collect）
     if (window.__MS_WS_BYPASS__) {
+      window.__MS_WS_BYPASS__ = false;
       currentRunId = null;
     } else {
       // 工作区收集：用户 code 抛异常也可能写过文件，成功失败都要收集

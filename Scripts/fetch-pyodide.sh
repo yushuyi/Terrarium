@@ -48,7 +48,8 @@ pkgs = lock["packages"] if isinstance(lock["packages"], dict) else {p["name"]: p
 # 只需从 PyPI 拉 tushare 本体（纯 wheel），依赖走本地离线伺服
 targets = ["numpy", "pandas", "matplotlib", "micropip",
            "requests", "beautifulsoup4", "lxml", "tqdm",
-           "typing-extensions", "simplejson", "ssl"]
+           "typing-extensions", "simplejson", "ssl",
+           "sqlite3"]  # 三期步骤 D：lockfile 有条目但 wheel 缺失 → Load failed 循环（2026-10-15）
 need = set()
 def add(name):
     if name in need or name not in pkgs:
