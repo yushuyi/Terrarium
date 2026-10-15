@@ -227,6 +227,8 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
         includedBytes: Int64,
         includedFileCount: Int,
         overGuard: Bool = false,
+        overGuardReason: WorkspaceSeedOverGuardReason = .overLimit,
+        mode: WorkspaceInjectionMode = .full,
         lastPayloadBytes: Int = 0,
         lastUncompressedBytes: Int = 0,
         skipped: Bool = false
@@ -243,6 +245,8 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
             lastInjectionUncompressedBytes: lastUncompressedBytes,
             lastSeedSkipped: skipped,
             lastSeedOverGuard: overGuard,
+            lastInjectionMode: mode,
+            lastSeedOverGuardReason: overGuardReason,
             fingerprintStable: false
         )
     }
@@ -319,6 +323,40 @@ final class PyodideBridgeSnapshotFilterTests: XCTestCase {
     func testLastInjectionVolumeText_overGuard() {
         let h = makeHealth(includedBytes: 33 * 1024 * 1024, includedFileCount: 599, overGuard: true)
         XCTAssertEqual(h.lastInjectionVolumeText, "超护栏放弃注入，MEMFS 退化为隔离态")
+    }
+
+    /// overGuard 细分（二期步骤 E，一期遗留顺路项）：压缩失败≠超护栏——
+    /// 前者是瞬时故障（重试即可），后者是持久性问题（要清理）。口径混在
+    /// 一起会把「重试就行」误报成「快去清理」
+    func testLastInjectionVolumeText_overGuard_compressFailed() {
+        let h = makeHealth(
+            includedBytes: 33 * 1024 * 1024, includedFileCount: 599,
+            overGuard: true, overGuardReason: .compressFailed
+        )
+        XCTAssertEqual(h.lastInjectionVolumeText, "压缩失败，本轮未注入（下次 run 自动重试）")
+        XCTAssertEqual(h.level, .overGuard, "细分只改文案，状态机不变")
+    }
+
+    // MARK: - 注入模式行（二期步骤 E，§六 #1）
+
+    /// 模式文案三态：按需 / 全量 / 按需回退。回退态必须显式暴露——
+    /// 「预测失效」只有在这里可见，混进全量口径里灰度期就没人看得到了
+    func testInjectionModeDisplayText() {
+        XCTAssertEqual(WorkspaceInjectionMode.onDemand.displayText, "按需注入")
+        XCTAssertEqual(WorkspaceInjectionMode.full.displayText, "全量注入")
+        XCTAssertEqual(WorkspaceInjectionMode.fullFallback.displayText, "全量注入（按需回退）")
+    }
+
+    /// 模式行详情文案：按需态必须把「体积小是特性」写在明面上——
+    /// 防止 22.9MB → KB 量级的骤降被当 bug 报（§六 #1 的核心诉求）
+    func testInjectionModeDetailText_onDemandExplainsShrinkage() {
+        let onDemand = makeHealth(includedBytes: 331_000, includedFileCount: 12, mode: .onDemand)
+        XCTAssertTrue(onDemand.lastInjectionModeDetailText.contains("按需注入"), onDemand.lastInjectionModeDetailText)
+        XCTAssertTrue(onDemand.lastInjectionModeDetailText.contains("特性"), onDemand.lastInjectionModeDetailText)
+        let fallback = makeHealth(includedBytes: 7_000_000, includedFileCount: 406, mode: .fullFallback)
+        XCTAssertTrue(fallback.lastInjectionModeDetailText.contains("回退"), fallback.lastInjectionModeDetailText)
+        let full = makeHealth(includedBytes: 7_000_000, includedFileCount: 406)
+        XCTAssertTrue(full.lastInjectionModeDetailText.contains("全量"), full.lastInjectionModeDetailText)
     }
 
     /// 新字段带默认值：既有构造点（体检页 VC、本文件工厂）不传也能编译。

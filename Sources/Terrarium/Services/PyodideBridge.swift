@@ -475,6 +475,12 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 最近一次 seed 走了哪条分支：跳过 / 超护栏退化 / 正常注入
     private var wsLastSeedSkipped = false
     private var wsLastSeedOverGuard = false
+    /// 最近一次注入的模式（二期步骤 E，§六 #1）：按需 / 全量 / 按需回退。
+    /// skip 分支沿用上次的模式——体检页「注入模式」行在稳态下也要有值
+    private var wsLastInjectionMode: WorkspaceInjectionMode = .full
+    /// overGuard 的细分原因（§六顺路项，一期遗留）：超护栏放弃 vs 压缩
+    /// 失败放弃——两者 UI 文案不同，但都走 overGuard 状态机
+    private var wsLastOverGuardReason: WorkspaceSeedOverGuardReason = .overLimit
 
     /// 显式前缀剥离取相对 Documents 路径。此前 dropFirst(count+1) 隐式
     /// 计算在真机上多剥 2 字符（'Documents'→'cuments'），排除前缀失效、
@@ -760,13 +766,21 @@ public final class PyodideBridge: NSObject, ObservableObject {
         // 开关语义（§3.4）：activeSet 非 nil 才走按需口径；指纹/打包/写回
         // 三处以它为同一基准（P2-1 单一基准约束）
         var activeSet: Set<String>? = (Self.predictiveEnabled && injectionSet != nil) ? injectionSet : nil
+        // 回退标志（步骤 E）：预测请求了注入集但探测失败 → 模式记
+        // fullFallback，与「本来就没 hint 的全量」在体检页可区分
+        var fellBackToFull = false
         if activeSet != nil, documentsFingerprint(set: activeSet) == nil {
             // 注入集探测失败（文件被删/落排除集/超护栏——预测与实况的
             // 竞态窗口）→ 回退全量；不引入新的失败模式
             AppLog.log("[Pyodide] 注入集探测失败（缺失/超限），回退全量注入",
                    log: Log.pyodide)
             activeSet = nil
+            fellBackToFull = true
         }
+        // 本轮注入模式（含放弃注入的轮次——体检页展示的是「当时尝试的模式」）
+        let injectionMode: WorkspaceInjectionMode = activeSet != nil
+            ? .onDemand
+            : (fellBackToFull ? .fullFallback : .full)
         if wsInjectedIntoCurrentPage,
            let fp = wsLastFingerprint,
            fp == documentsFingerprint(set: activeSet) {
@@ -775,7 +789,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
             recordSeed(at: Date(), fileCount: wsLastInjectionFileCount,
                        payloadBytes: wsLastInjectionPayloadBytes,
                        uncompressedBytes: wsLastInjectionUncompressedBytes,
-                       skipped: true, overGuard: false)
+                       skipped: true, overGuard: false,
+                       mode: wsLastInjectionMode)
             return "" // MEMFS 与宿主一致，零开销跳过
         }
         // activeSet 非 nil 时到不了这（上方探测失败已回退全量）；此处 nil
@@ -784,7 +799,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
             AppLog.log("[Pyodide] 工作区快照跳过：Documents 超护栏（>32MB 或 >2000 文件）",
                    log: Log.pyodide)
             recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, uncompressedBytes: 0,
-                       skipped: true, overGuard: true)
+                       skipped: true, overGuard: true, mode: injectionMode)
             // 跳过≠可疑：host.js 据此走「白纸 + 收集回写」降级通道而非熔断
             _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
             return ""
@@ -794,7 +809,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
         }.value
         guard let (entries, payloadData) = packed else {
             recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, uncompressedBytes: 0,
-                       skipped: true, overGuard: true)
+                       skipped: true, overGuard: true, mode: injectionMode)
             _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
             return ""
         }
@@ -809,7 +824,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
             // 扩 UI 状态机，细分文案留二期
             recordSeed(at: Date(), fileCount: entries.count, payloadBytes: 0,
                        uncompressedBytes: payloadData.count,
-                       skipped: true, overGuard: true)
+                       skipped: true, overGuard: true, mode: injectionMode,
+                       overGuardReason: .compressFailed)
             _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
             AppLog.log("[Pyodide] 工作区快照压缩失败，本轮不恢复（文件数=%{public}ld）",
                    log: Log.pyodide, Int32(entries.count))
@@ -841,7 +857,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
         wsInjectedIntoCurrentPage = true
         recordSeed(at: Date(), fileCount: entries.count, payloadBytes: compressed.count,
                    uncompressedBytes: payloadData.count,
-                   skipped: false, overGuard: false)
+                   skipped: false, overGuard: false, mode: injectionMode)
         // 注入成功即清除跳过标记：同页后续 run 的告警语义回到 ready 口径
         _ = await evaluate("window.__MS_WS_SKIPPED__ = false; 'ok'")
         AppLog.log("[Pyodide] 工作区快照注入完成 模式=%{public}@ 文件数=%{public}ld 原始=%{public}ld 字节 压缩后=%{public}ld 字节",
@@ -850,15 +866,20 @@ public final class PyodideBridge: NSObject, ObservableObject {
         return ""
     }
 
-    /// 记录最近一次 seed 分支（体检页数据源，不参与注入决策）
+    /// 记录最近一次 seed 分支（体检页数据源，不参与注入决策）。
+    /// mode 传 nil = 沿用上次模式（skip 分支：本轮没搬字节，模式不变）
     private func recordSeed(at date: Date, fileCount: Int, payloadBytes: Int,
-                            uncompressedBytes: Int, skipped: Bool, overGuard: Bool) {
+                            uncompressedBytes: Int, skipped: Bool, overGuard: Bool,
+                            mode: WorkspaceInjectionMode? = nil,
+                            overGuardReason: WorkspaceSeedOverGuardReason = .overLimit) {
         wsLastInjectionAt = date
         wsLastInjectionFileCount = fileCount
         wsLastInjectionPayloadBytes = payloadBytes
         wsLastInjectionUncompressedBytes = uncompressedBytes
         wsLastSeedSkipped = skipped
         wsLastSeedOverGuard = overGuard
+        if let mode { wsLastInjectionMode = mode }
+        wsLastOverGuardReason = overGuardReason
     }
 
     // MARK: - 工作区快照体检（DEBUG「Pyodide 运行时体检」页数据源）
@@ -953,6 +974,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
             lastInjectionUncompressedBytes: wsLastInjectionUncompressedBytes,
             lastSeedSkipped: wsLastSeedSkipped,
             lastSeedOverGuard: wsLastSeedOverGuard,
+            lastInjectionMode: wsLastInjectionMode,
+            lastSeedOverGuardReason: wsLastOverGuardReason,
             fingerprintStable: stable
         )
     }
@@ -1627,6 +1650,33 @@ public struct WorkspaceFolderStat: Sendable, Identifiable, Hashable {
     public var isFullyExcluded: Bool { fileCount == 0 && excludedFileCount > 0 }
 }
 
+/// 最近一次注入的模式（二期步骤 E，§六 #1）
+public enum WorkspaceInjectionMode: String, Sendable {
+    /// 按需注入：预测命中，注入集 = 本次命令相关子集
+    case onDemand
+    /// 全量注入：无 hint（或开关关）下的 Documents 全量口径
+    case full
+    /// 全量注入（按需回退）：预测请求了注入集但探测失败 → 回退全量
+    case fullFallback
+
+    /// 体检页展示文案（下沉到模型侧，单测可锁）
+    public var displayText: String {
+        switch self {
+        case .onDemand: return "按需注入"
+        case .full: return "全量注入"
+        case .fullFallback: return "全量注入（按需回退）"
+        }
+    }
+}
+
+/// overGuard（放弃注入）的细分原因（一期遗留顺路项，§六）
+public enum WorkspaceSeedOverGuardReason: String, Sendable {
+    /// 超护栏（或打包失败）：体积/文件数超限，走白纸降级通道
+    case overLimit
+    /// 压缩失败：体积合规但 zlib 失败，本轮不注入、下次 run 自动重试
+    case compressFailed
+}
+
 /// 工作区快照健康状态（体检页顶部卡片）
 public struct WorkspaceSnapshotHealth: Sendable {
     public let includedFileCount: Int
@@ -1648,6 +1698,10 @@ public struct WorkspaceSnapshotHealth: Sendable {
     public let lastSeedSkipped: Bool
     /// 最近一次 seed 是否因超护栏而放弃注入（MEMFS 退化为隔离态）
     public let lastSeedOverGuard: Bool
+    /// 最近一次注入的模式（§六 #1）：按需 / 全量 / 按需回退
+    public let lastInjectionMode: WorkspaceInjectionMode
+    /// overGuard 细分原因：超护栏放弃 vs 压缩失败放弃（一期遗留顺路项）
+    public let lastSeedOverGuardReason: WorkspaceSeedOverGuardReason
     /// 当前宿主指纹与上次注入时一致 → 下次 run 可跳过搬运
     public let fingerprintStable: Bool
 
@@ -1666,6 +1720,8 @@ public struct WorkspaceSnapshotHealth: Sendable {
         lastInjectionUncompressedBytes: Int = 0,
         lastSeedSkipped: Bool,
         lastSeedOverGuard: Bool,
+        lastInjectionMode: WorkspaceInjectionMode = .full,
+        lastSeedOverGuardReason: WorkspaceSeedOverGuardReason = .overLimit,
         fingerprintStable: Bool
     ) {
         self.includedFileCount = includedFileCount
@@ -1679,6 +1735,8 @@ public struct WorkspaceSnapshotHealth: Sendable {
         self.lastInjectionUncompressedBytes = lastInjectionUncompressedBytes
         self.lastSeedSkipped = lastSeedSkipped
         self.lastSeedOverGuard = lastSeedOverGuard
+        self.lastInjectionMode = lastInjectionMode
+        self.lastSeedOverGuardReason = lastSeedOverGuardReason
         self.fingerprintStable = fingerprintStable
     }
 
@@ -1687,7 +1745,14 @@ public struct WorkspaceSnapshotHealth: Sendable {
     /// 体积——指纹一致是常态，恰恰是这一行被看得最多，不带等于把最该
     /// 观察的稳态藏起来了（v4 验收项）
     public var lastInjectionVolumeText: String {
-        if lastSeedOverGuard { return "超护栏放弃注入，MEMFS 退化为隔离态" }
+        if lastSeedOverGuard {
+            // 细分文案（一期遗留顺路项）：超护栏=持久性问题（清理才能
+            // 恢复），压缩失败=瞬时故障（下次 run 自动重试）——口径混在
+            // 一起会把「重试就行」误报成「快去清理」
+            return lastSeedOverGuardReason == .compressFailed
+                ? "压缩失败，本轮未注入（下次 run 自动重试）"
+                : "超护栏放弃注入，MEMFS 退化为隔离态"
+        }
         let raw = Self.byteText(lastInjectionUncompressedBytes)
         if lastSeedSkipped {
             return "指纹一致，零开销跳过 · 上次注入 \(raw)"
@@ -1697,6 +1762,20 @@ public struct WorkspaceSnapshotHealth: Sendable {
 
     private static func byteText(_ bytes: Int) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .binary)
+    }
+
+    /// 「注入模式」行的展示文案（§六 #1）。核心诉求：按需模式下「上次
+    /// 注入」的体积从 22.9MB 量级骤降到 KB~MB 量级，不解释口径会被
+    /// 当 bug 报——这行把「变小是特性」写在明面上
+    public var lastInjectionModeDetailText: String {
+        switch lastInjectionMode {
+        case .onDemand:
+            return "按需注入 · 只搬本次命令预测需要的文件，体积小是特性而非异常"
+        case .fullFallback:
+            return "全量注入（按需回退）· 预测集探测失败，本轮整包兜底"
+        case .full:
+            return "全量注入 · Documents 全量口径"
+        }
     }
 
     /// 体积占用率（0...1+，超护栏时 >1）
