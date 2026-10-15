@@ -686,13 +686,24 @@ async function runPython(id, code) {
       }
       try {
         await pyodide.loadPackage("micropip", { messageCallback: () => {}, errorCallback: () => {} });
-        // 直接 await（与下方 FALLBACK PATH 同模式）：不经 ensure_future
-        // 任务——任务内异常会触发 asyncio "Unhandled exception in event
-        // loop" 全 traceback 刷屏（2026-09-29 现场第二噪声源）
-        await pyodide.runPythonAsync(
+        // 三期方案 P0-2：micropip 走 pyfetch（WebKit 直连）无内建超时，
+        // 目标挂起会拖死整条 runPython promise → busy 门闩永不释放
+        // （2026-10-15 体检 pip3 锁死根因）。外层 60s 限时：超时弃单
+        // （孤儿 fetch 迟到完成只影响内存态）→ 错误经下方 catch(retryErr)
+        // 双写保留原始 MNFE
+        const _msInstallP = pyodide.runPythonAsync(
           `import micropip as _ms_mip
 await _ms_mip.install([${JSON.stringify(modName)}])`
         );
+        _msInstallP.catch(() => {}); // 弃单后防 unhandled rejection
+        await Promise.race([
+          _msInstallP,
+          new Promise((_, rej) => setTimeout(() => rej(new Error(
+            `无法自动安装 ${modName}（60s 安装超时，micropip 网络直连无内建超时）。`
+            + "预置包：numpy/pandas/matplotlib/lxml/bs4/requests/pillow/tqdm；"
+            + "网络请求请走原生 python3/curl"
+          )), 60000)),
+        ]);
         // persist 落盘：与终端 pip 壳同款 zip 镜像（经 stdout 标记行回传
         // Swift storePersistMirror），否则装完重启即丢
         persistB64 = "";
