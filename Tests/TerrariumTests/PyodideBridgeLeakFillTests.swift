@@ -145,6 +145,23 @@ final class PyodideBridgeLeakFillTests: XCTestCase {
 
     // MARK: - 目录补齐（§4.3 阈值）
 
+    func testExpand_directoryFN_bodyNotInjected() throws {
+        // 审查 P2 毒化回归锚点：FN 对象本身是目录（open/scandir）时，
+        // 目录本体绝不能入注入集——documentsFingerprintImpl 遇非 regular
+        // 一律 return nil，目录 rel 入集 = 指纹恒 nil = 该脚本永久回退全量
+        // （真机 poison_b 实证）。只收目录内的 regular 文件
+        try write("s.py")
+        try write("poison_dir/a.csv")
+        try write("poison_dir/sub/b.json")
+        let expanded = try XCTUnwrap(PyodideBridge.expandInjectionSet(
+            base: ["s.py"], missingRel: "poison_dir", docsPath: docsPath))
+        XCTAssertFalse(expanded.set.contains("poison_dir"), "目录本体不入集")
+        // 目录树以 regular 文件入集（枚举顺序不保证，按集合语义断言）
+        XCTAssertEqual(Set(expanded.added), ["poison_dir/a.csv", "poison_dir/sub/b.json"])
+        // 指纹对扩充集必须可算（毒化修复的核心断言：不再恒 nil）
+        XCTAssertNotNil(PyodideBridge.documentsFingerprintImpl(docs: docs, set: expanded.set))
+    }
+
     func testExpand_smallDirectory_fillsWholeTree() throws {
         try write("s.py")
         for i in 0..<10 { try write("data/part\(i).csv") }
@@ -263,5 +280,24 @@ final class PyodideBridgeLeakFillTests: XCTestCase {
         XCTAssertEqual(PyodideBridge.mergedWithLearned(
             code: "never-recorded", base: ["a.csv"], docsPath: docsPath, cacheURL: cacheURL),
             ["a.csv"])
+    }
+
+    func testMergedWithLearned_directoryEntryPruned() throws {
+        // 审查 P2 毒化回归锚点：旧缓存里的目录条目（expandInjectionSet
+        // 修复前写入）必须剪除并绝不入合并集——否则指纹恒 nil、该脚本
+        // 每跑回退全量。旧毒缓存经此自愈
+        try write("s.py")
+        try write("poison_dir/a.csv")
+        let code = "dir-poison"
+        WorkspaceLearnCache.record(code: code,
+                                   rels: ["poison_dir", "s.py"],
+                                   cacheURL: cacheURL)
+        let merged = PyodideBridge.mergedWithLearned(
+            code: code, base: ["s.py"], docsPath: docsPath, cacheURL: cacheURL)
+        XCTAssertEqual(merged, ["s.py"], "目录条目不入合并集")
+        XCTAssertNotNil(PyodideBridge.documentsFingerprintImpl(docs: docs, set: merged))
+        let after = try XCTUnwrap(WorkspaceLearnCache.learnedRels(
+            forKey: WorkspaceLearnCache.key(forCode: code), cacheURL: cacheURL))
+        XCTAssertFalse(after.contains("poison_dir"), "毒条目剪除（自愈）")
     }
 }

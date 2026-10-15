@@ -13,6 +13,9 @@ let pyodide = null;
 let pyodideReady = false;
 let stdoutBuf = "";
 let stderrBuf = "";
+// 未流式尾段：currentRunId==null 期的 stderr（bootWarnings、快照桥诊断），
+// 随 runResult.preRunStderr 回传一次后清空（一次性诊断，不随每次 run 重复）
+let preRunStderrBuf = "";
 let progressBuf = [];
 // 当前正在执行的 runPython 调用 id——stdout/stderr 回调据此做流式转发
 let currentRunId = null;
@@ -63,6 +66,14 @@ async function bootstrap() {
       },
       stderr: (text) => {
         stderrBuf += text + "\n";
+        // 未流式尾段（审查 P1 修复）：currentRunId==null 期的 stderr
+        // （bootWarnings、快照桥诊断等）不进流式通道，单独聚合随
+        // runResult.preRunStderr 回传——Swift 侧补写只落这一段。此前
+        // 直接补写聚合全量 stderrBuf，与流式逐行输出构成双份（每条含
+        // stderr 的命令用户可见翻倍，真机 MARK_PD_1 实证）
+        if (!currentRunId) {
+          preRunStderrBuf += text + "\n";
+        }
         if (currentRunId) {
           post({ kind: "stderr", id: currentRunId, line: text });
         }
@@ -355,7 +366,9 @@ function resetBuffers() {
 
 async function runPython(id, code) {
   if (!pyodideReady) {
-    post({ kind: "runResult", id, stdout: "", stderr: "Pyodide not yet ready", exception: null, exitCode: -1, durationMs: 0 });
+    // 未流式场景（审查 P1 兜底）：本消息只存在于 runResult.stderr，不会
+    // 走流式通道——必须同时挂 preRunStderr，Installer 的终端补写才看得见
+    post({ kind: "runResult", id, stdout: "", stderr: "Pyodide not yet ready", preRunStderr: "Pyodide not yet ready", exception: null, exitCode: -1, durationMs: 0 });
     return;
   }
   resetBuffers();
@@ -755,8 +768,13 @@ if _n:
     stdout: stdoutBuf,
     // 二期补漏判定双源（方案 §4.1）：stderr 聚合随 runResult 回传——
     // asyncio 任务内异常只落 stderr 流式通道，runResult.stderr 恒空串
-    // 会让 Swift 侧补漏判定漏掉这一类 FN（stdout 同款聚合语义）
+    // 会让 Swift 侧补漏判定漏掉这一类 FN（stdout 同款聚合语义）。
+    // 注意：本字段是聚合全量，Swift 侧**不得**直接补写进终端（流式已
+    // 逐行落地，补写=双份）——终端补写只用 preRunStderr
     stderr: stderrBuf,
+    // 未流式尾段（审查 P1）：bootWarnings/快照桥诊断等 currentRunId==null
+    // 期的 stderr，回传一次后清空
+    preRunStderr: preRunStderrBuf,
     exception,
     exitCode,
     durationMs,
@@ -764,6 +782,7 @@ if _n:
     wsWriteB64,
   });
   wsWriteB64 = null;
+  preRunStderrBuf = ""; // 一次性诊断已随本次 runResult 送达，不再重复
 }
 
 /// savefig 文件名保留（测试计划 I-2）：patch Figure.savefig，用户

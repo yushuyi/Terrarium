@@ -167,9 +167,15 @@ enum WorkspaceInjectionPlanner {
             : (scriptRel as NSString).deletingLastPathComponent
         var layers = [sd]
         var cur = sd
-        while !cur.isEmpty {
+        // 只走 sd/p1/root 三层（审查 P2 修复）：与 dispatcher sys.path 补插
+        // （_mianshu_dispatcher boot：sd/p1/root 三层）严格对齐，也与本函数
+        // docstring 一致。旧 while 会为深度 ≥4 的脚本多走上探一层——
+        // skills/docx/scripts/sub/x.py 会把 skills/ 整树收进注入集（所有
+        // skill 的语料），而 dispatcher 的 sys.path 根本不含该层，纯多搬
+        for _ in 0..<2 {
             cur = (cur as NSString).deletingLastPathComponent
-            if !cur.isEmpty { layers.append(cur) }
+            if cur.isEmpty { break }
+            layers.append(cur)
         }
         for layer in layers {
             if layer.isEmpty {

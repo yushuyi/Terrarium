@@ -106,6 +106,23 @@ final class WorkspaceInjectionPlannerTests: XCTestCase {
         ])
     }
 
+    func testDeepScript_ancestorChainStopsAtRoot() throws {
+        // 审查 P2 回归锚点：深度 ≥4 的脚本，祖先链只走到 root（第三层），
+        // 与 dispatcher sys.path 补插（sd/p1/root 三层）严格对齐——旧 while
+        // 会多走上探一层，把 skills/ 整树（所有 skill 的语料）收进注入集
+        try write("skills/docx/scripts/sub/x.py")
+        try write("skills/docx/scripts/sub/util.py")   // sd 整树
+        try write("skills/docx/scripts/helper.py")     // p1 整树
+        try write("skills/docx/readme.py")             // root 整树
+        try write("skills/other/stray.py")             // 第四层：不收（多搬语料）
+        let set = try XCTUnwrap(plan(argv: [docsPath + "/skills/docx/scripts/sub/x.py"]))
+        XCTAssertTrue(set.contains("skills/docx/scripts/sub/util.py"))
+        XCTAssertTrue(set.contains("skills/docx/scripts/helper.py"))
+        XCTAssertTrue(set.contains("skills/docx/readme.py"))
+        XCTAssertFalse(set.contains("skills/other/stray.py"), "祖先链止于 root 层")
+        XCTAssertFalse(set.contains("skills/other"), "skills/ 树不入集")
+    }
+
     func testOfficeCommon_includedWhenExists() throws {
         try write("skills/a/skill.py")
         try write("office-common/entry_utils.py")

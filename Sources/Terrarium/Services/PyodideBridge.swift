@@ -813,7 +813,8 @@ public final class PyodideBridge: NSObject, ObservableObject {
         }.value
         guard let (entries, payloadData) = packed else {
             recordSeed(at: Date(), fileCount: 0, payloadBytes: 0, uncompressedBytes: 0,
-                       skipped: true, overGuard: true, mode: injectionMode)
+                       skipped: true, overGuard: true, mode: injectionMode,
+                       overGuardReason: .packFailed)
             _ = await evaluate("window.__MS_WS_SKIPPED__ = true; 'ok'")
             return ""
         }
@@ -1105,9 +1106,13 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 invalid.append(rel)
                 continue
             }
-            let size = isDir.boolValue
-                ? 0
-                : ((try? fm.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.intValue ?? 0
+            if isDir.boolValue {
+                // 目录条目剪除（审查 P2 毒化修复）：目录 rel 入集会让指纹
+                // 恒 nil → 每跑回退全量。旧缓存里的毒条目在此自愈（prune）
+                invalid.append(rel)
+                continue
+            }
+            let size = ((try? fm.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.intValue ?? 0
             guard wsIncludedImpl(rel, fileSize: size) else {
                 invalid.append(rel)
                 continue
@@ -1196,6 +1201,14 @@ public final class PyodideBridge: NSObject, ObservableObject {
 
         func insert(_ rel: String) {
             guard !out.contains(rel) else { return }
+            var isDir2: ObjCBool = false
+            // 目录本体不入集（审查 P2 毒化修复）：documentsFingerprintImpl
+            // 遇非 regular 一律 return nil → 指纹恒 nil → 该脚本此后每跑
+            // 回退全量（真机 poison_b 实证 298KB→3.4MB 收益归零）。目录
+            // 内容经 insertDirTree 以 regular 文件入集；空目录 → added 空
+            // → nil 一次报错（宁一次报错不毒化指纹）
+            guard fm.fileExists(atPath: docsPath + "/" + rel, isDirectory: &isDir2),
+                  !isDir2.boolValue else { return }
             let attrs = try? fm.attributesOfItem(atPath: docsPath + "/" + rel)
             let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
             guard wsIncludedImpl(rel, fileSize: size) else { return } // 校验②
@@ -1534,6 +1547,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
             let runOutput = PyodideRunResult(
                 stdout: (body["stdout"] as? String) ?? "",
                 stderr: (body["stderr"] as? String) ?? "",
+                preRunStderr: (body["preRunStderr"] as? String) ?? "",
                 exception: body["exception"] as? String,
                 exitCode: (body["exitCode"] as? Int) ?? 0,
                 durationMs: (body["durationMs"] as? Int) ?? 0
@@ -1611,6 +1625,10 @@ public final class PyodideBridge: NSObject, ObservableObject {
 public struct PyodideRunResult: Sendable {
     public let stdout: String
     public let stderr: String
+    /// 未流式尾段（审查 P1）：currentRunId==null 期的 stderr（bootWarnings、
+    /// 快照桥诊断），host.js 随 runResult 回传一次后清空。终端补写只落
+    /// 这一段——stderr 聚合是全量（含流式已逐行落地的部分），补写它=双份
+    public var preRunStderr: String = ""
     public let exception: String?
     public let exitCode: Int
     public let durationMs: Int
@@ -1675,10 +1693,13 @@ public enum WorkspaceInjectionMode: String, Sendable {
 
 /// overGuard（放弃注入）的细分原因（一期遗留顺路项，§六）
 public enum WorkspaceSeedOverGuardReason: String, Sendable {
-    /// 超护栏（或打包失败）：体积/文件数超限，走白纸降级通道
+    /// 超护栏：体积/文件数超限，走白纸降级通道
     case overLimit
     /// 压缩失败：体积合规但 zlib 失败，本轮不注入、下次 run 自动重试
     case compressFailed
+    /// 打包失败（审查 P3-3）：枚举快照条目阶段失败（读文件/编码异常），
+    /// 与超护栏语义不同——护栏是数据太大，本类是过程异常，同样自动重试
+    case packFailed
 }
 
 /// 工作区快照健康状态（体检页顶部卡片）
