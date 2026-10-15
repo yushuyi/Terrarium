@@ -1261,6 +1261,11 @@ public final class PyodideBridge: NSObject, ObservableObject {
         // （回退/开关关）下 MEMFS 已含全部 included，FN 只能来自「宿主也
         // 没有」或「排除集文件」，两者都过不了校验链，空转无益
         if var activeSet = injectionSet {
+            // 补漏监视（灰度观测点）：无条件打印首轮判定输入，便于定位
+            // 「exitCode / 判定源」矩阵的真实形态（方案 §4.2 取证表）
+            AppLog.log("[Pyodide] 补漏监视：exit=%{public}ld exception=%{public}@ stderrLen=%{public}ld",
+                   log: Log.pyodide, Int32(result.exitCode),
+                   String((result.exception ?? "nil").prefix(120)), Int32(result.stderr.count))
             var round = 0
             var addedByRetries: [String] = []
             while result.exitCode != 0, round < Self.wsMaxLeakFillRounds {
@@ -1268,12 +1273,28 @@ public final class PyodideBridge: NSObject, ObservableObject {
                 // FN 文本；exitCode ≠ 0 门槛已由循环条件承担（try/except
                 // 捕获后正常退出的无辜脚本不触发重跑）
                 guard let raw = Self.extractMissingFilePath(exception: result.exception,
-                                                            stderr: result.stderr),
-                      let missingRel = Self.normalizeMissingRel(raw, docsPath: docsPath),
-                      let expanded = Self.expandInjectionSet(base: activeSet,
+                                                            stderr: result.stderr) else {
+                    AppLog.log("[Pyodide] 补漏判定：exit=%{public}ld 但无 FileNotFoundError 文本（exception=%{public}@ stderr=%{public}@）→ 原样报错",
+                           log: Log.pyodide, Int32(result.exitCode),
+                           String((result.exception ?? "nil").prefix(200)),
+                           String(result.stderr.prefix(200)))
+                    break
+                }
+                guard let missingRel = Self.normalizeMissingRel(raw, docsPath: docsPath) else {
+                    AppLog.log("[Pyodide] 补漏判定：FN 路径 %{public}@ 归一失败 → 原样报错",
+                           log: Log.pyodide, String(raw.prefix(200)))
+                    break
+                }
+                guard let expanded = Self.expandInjectionSet(base: activeSet,
                                                              missingRel: missingRel,
                                                              docsPath: docsPath),
-                      !expanded.added.isEmpty else { break }
+                      !expanded.added.isEmpty else {
+                    // 校验链①②不过（宿主也没有 / 排除集 / 已在集内）——
+                    // 观测点（灰度期统计 FN 不可恢复占比）
+                    AppLog.log("[Pyodide] 补漏判定：%{public}@ 校验不过（宿主不存在/排除集/已在集内）→ 原样报错",
+                           log: Log.pyodide, missingRel)
+                    break
+                }
                 round += 1
                 activeSet = expanded.set
                 addedByRetries.append(contentsOf: expanded.added)

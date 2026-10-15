@@ -753,7 +753,10 @@ if _n:
     kind: "runResult",
     id,
     stdout: stdoutBuf,
-    stderr: "",
+    // 二期补漏判定双源（方案 §4.1）：stderr 聚合随 runResult 回传——
+    // asyncio 任务内异常只落 stderr 流式通道，runResult.stderr 恒空串
+    // 会让 Swift 侧补漏判定漏掉这一类 FN（stdout 同款聚合语义）
+    stderr: stderrBuf,
     exception,
     exitCode,
     durationMs,
