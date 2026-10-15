@@ -392,6 +392,13 @@ public final class PyodideBridge: NSObject, ObservableObject {
     /// 单文件上限：大二进制（数据库/媒体）不进快照，避免注入与收集
     /// 载荷把同步 XHR/postMessage 通道拖垮（首版全量打包曾卡死 App）
     nonisolated static let wsMaxFileBytes = 8 * 1024 * 1024
+    /// 补漏目录补齐阈值（二期方案 §4.3，审查 P3-3：旧稿 50 与「轮次上限 2」
+    /// 组合意味着 >50 文件的目录 glob 必然两轮后报错不收敛——与宁多勿漏
+    /// 冲突，放宽到 200；8MB 总量不变，真正的体积闸门。200 仍是有意降级）
+    nonisolated static let wsDirFillMaxFiles = 200
+    nonisolated static let wsDirFillMaxBytes = 8 * 1024 * 1024
+    /// 补漏轮次上限（§4.1：两轮后仍 FileNotFoundError 原样报错，防死循环）
+    nonisolated static let wsMaxLeakFillRounds = 2
     /// 快照排除：App 私有数据目录与运行时通道文件。persist zip 走专用
     /// 镜像通道；其余是聊天/记忆/收件箱等 App 自管数据，不参与 pyodide
     /// 工作区。快照只覆盖用户工作产物（tests/、pyodide_figures/、tmp/
@@ -1049,6 +1056,162 @@ public final class PyodideBridge: NSObject, ObservableObject {
             argv: argv, pathHints: pathHints, docsPath: docs.standardizedFileURL.path)
     }
 
+    // MARK: 补漏（二期步骤 C，方案 §四）
+
+    /// 学习缓存收编（§4.5 读侧）：learned rels 逐项过双闸（①宿主存在性 +
+    /// ②wsIncludedImpl 排除集）后并入注入集；任一闸不过即失效并剪除缓存
+    /// （文件被删/移出、或落入排除集——都永远不会可注入，留着只耗 LRU 名额）。
+    /// 学到手的路径不比 argv 提取的更受信任。
+    nonisolated static func mergedWithLearned(code: String, base: Set<String>,
+                                              docsPath: String, cacheURL: URL? = nil,
+                                              fm: FileManager = .default) -> Set<String> {
+        guard let learned = WorkspaceLearnCache.learnedRels(
+            forKey: WorkspaceLearnCache.key(forCode: code), cacheURL: cacheURL),
+              !learned.isEmpty else { return base }
+        var out = base
+        var invalid: [String] = []
+        for rel in learned {
+            guard out.contains(rel) == false else { continue }
+            var isDir: ObjCBool = false
+            let path = docsPath + "/" + rel
+            guard fm.fileExists(atPath: path, isDirectory: &isDir) else {
+                invalid.append(rel)
+                continue
+            }
+            let size = isDir.boolValue
+                ? 0
+                : ((try? fm.attributesOfItem(atPath: path))?[.size] as? NSNumber)?.intValue ?? 0
+            guard wsIncludedImpl(rel, fileSize: size) else {
+                invalid.append(rel)
+                continue
+            }
+            out.insert(rel)
+        }
+        if !invalid.isEmpty {
+            WorkspaceLearnCache.prune(key: WorkspaceLearnCache.key(forCode: code),
+                                      rels: invalid, cacheURL: cacheURL)
+        }
+        return out
+    }
+
+    /// FileNotFoundError 路径提取（§4.2）。判定源在调用方已双源拼接
+    /// （exception ∪ stderr——asyncio 任务内异常只落 stderr，host.js:677
+    /// 自证）；本函数只管扫 FN 文本。覆盖单/双引号形态：
+    ///   `FileNotFoundError: [Errno 2] No such file or directory: '<path>'`
+    /// 返回原始路径串（归一在 normalizeMissingRel）。
+    nonisolated static func extractMissingFilePath(exception: String?, stderr: String) -> String? {
+        let joined = ((exception ?? "") + "\n" + stderr)
+        guard joined.contains("FileNotFoundError") else { return nil }
+        let pattern = "FileNotFoundError[^\\n]*?No such file or directory:\\s*(?:'([^\\n']*)'|\"([^\\n\"]*)\")"
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let ns = joined as NSString
+        guard let m = re.firstMatch(in: joined, range: NSRange(location: 0, length: ns.length)) else {
+            return nil
+        }
+        for i in 1..<max(m.numberOfRanges, 1) {
+            if let r = Range(m.range(at: i), in: joined) { return String(joined[r]) }
+        }
+        return nil
+    }
+
+    /// FN 报错路径 → Documents rel（§4.2 归一）：
+    /// - MEMFS 绝对形态（<DOCROOT>/Documents/<rel> 或宿主 /var 形态）
+    ///   → documentsRel 同款锚点归一；
+    /// - 裸相对形态（'data/x.csv'——Pyodide cwd = Documents 已实证
+    ///   host.js:255，相对读取的 FN 是裸相对形态入 traceback）→ 直接按
+    ///   rel 处理（拒绝 .. / . 成分与空串）。
+    nonisolated static func normalizeMissingRel(_ raw: String, docsPath: String) -> String? {
+        if let rel = WorkspaceInjectionPlanner.documentsRel(raw, docsPath: docsPath) { return rel }
+        guard !raw.hasPrefix("/") else { return nil }
+        var t = raw
+        while t.hasPrefix("./") { t = String(t.dropFirst(2)) }
+        guard !t.isEmpty else { return nil }
+        let comps = t.split(separator: "/").map(String.init)
+        guard !comps.contains(".."), !comps.contains(".") else { return nil }
+        return t
+    }
+
+    /// 补漏目录补齐判定（§4.3）：所在目录 ≤200 文件且 ≤8MB → 整目录补齐
+    /// （glob 遍历一轮收敛）；否则只补单文件。
+    nonisolated static func directoryFillEligible(_ dirRel: String, docsPath: String,
+                                                  fm: FileManager = .default) -> Bool {
+        let dirURL = URL(fileURLWithPath: docsPath, isDirectory: true)
+            .appendingPathComponent(dirRel, isDirectory: true)
+        guard let en = fm.enumerator(at: dirURL,
+                                     includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]) else {
+            return false
+        }
+        var count = 0
+        var total = 0
+        for case let url as URL in en {
+            guard let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  v.isRegularFile == true else { continue }
+            count += 1
+            total += v.fileSize ?? 0
+            if count > wsDirFillMaxFiles || total > wsDirFillMaxBytes { return false }
+        }
+        return count > 0
+    }
+
+    /// 补漏扩充（§4.1 校验链 + §4.3 目录补齐）。校验顺序承重（审查 P1-1）：
+    /// ① 宿主存在性探测——不过 → nil，原样报错不重跑（FN ≠「注入集缺
+    ///    文件」，也可能是宿主也没有；缺这环会让探测性读不存在的可选
+    ///    文件副作用执行 3 遍，违反「永不比现状差」）；
+    /// ② wsIncludedImpl 排除集（越界/排除集/单文件超限的文件不收）。
+    /// 目录补齐：所在目录过 directoryFillEligible → 整目录收编。
+    /// 返回 (扩充集, 本次新增 rel 列表)；nil = 校验不过 / 无可新增。
+    nonisolated static func expandInjectionSet(base: Set<String>, missingRel: String,
+                                               docsPath: String,
+                                               fm: FileManager = .default)
+    -> (set: Set<String>, added: [String])? {
+        var out = base
+        var added: [String] = []
+
+        func insert(_ rel: String) {
+            guard !out.contains(rel) else { return }
+            let attrs = try? fm.attributesOfItem(atPath: docsPath + "/" + rel)
+            let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+            guard wsIncludedImpl(rel, fileSize: size) else { return } // 校验②
+            out.insert(rel)
+            added.append(rel)
+        }
+
+        func insertDirTree(_ dirRel: String) {
+            let dirURL = URL(fileURLWithPath: docsPath, isDirectory: true)
+                .appendingPathComponent(dirRel, isDirectory: true)
+            guard let en = fm.enumerator(at: dirURL,
+                                         includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]) else {
+                return
+            }
+            let prefix = dirURL.standardizedFileURL.path + "/"
+            for case let url as URL in en {
+                guard let v = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                      v.isRegularFile == true else { continue }
+                let p = url.standardizedFileURL.path
+                guard p.hasPrefix(prefix) else { continue }
+                insert(dirRel + "/" + String(p.dropFirst(prefix.count)))
+            }
+        }
+
+        var isDir: ObjCBool = false
+        // 校验①（顺序承重）：宿主必须真实存在该路径
+        guard fm.fileExists(atPath: docsPath + "/" + missingRel, isDirectory: &isDir) else {
+            return nil
+        }
+        insert(missingRel)
+        if isDir.boolValue {
+            // 报错对象本身是目录（open 目录 / scandir）——整目录收编
+            insertDirTree(missingRel)
+        } else {
+            let parent = (missingRel as NSString).deletingLastPathComponent
+            if !parent.isEmpty, directoryFillEligible(parent, docsPath: docsPath, fm: fm) {
+                insertDirTree(parent)
+            }
+        }
+        guard !added.isEmpty else { return nil }
+        return (out, added)
+    }
+
     public func runPython(code: String) async -> PyodideRunResult {
         await runPython(code: code, onOutput: nil, timeout: nil)
     }
@@ -1074,7 +1237,6 @@ public final class PyodideBridge: NSObject, ObservableObject {
             return PyodideRunResult(stdout: "", stderr: loadError ?? "Pyodide not ready",
                                     exception: nil, exitCode: -1, durationMs: 0)
         }
-        let id = UUID().uuidString
         if let workspaceArgv, !workspaceArgv.isEmpty {
             AppLog.log("[Pyodide] workspaceArgv 透传 (%{public}ld 项): %{public}@",
                    log: Log.pyodide, Int32(workspaceArgv.count),
@@ -1083,11 +1245,61 @@ public final class PyodideBridge: NSObject, ObservableObject {
         // 注入集预测（二期步骤 B，方案 §三）：开关开启且有管道输入时计算。
         // 开关关闭零参与（连 planner 都不跑）；planner 返回 nil（提取失败/
         // 超限/脚本定位失败）→ seedWorkspaceMirror 落全量口径
-        let injectionSet: Set<String>? =
+        var injectionSet: Set<String>? =
             (Self.predictiveEnabled && (workspaceArgv != nil || workspacePathHints != nil))
             ? Self.planInjectionSet(argv: workspaceArgv, pathHints: workspacePathHints)
             : nil
-        await seedWorkspaceMirror(injectionSet: injectionSet) // I-4：快照注入（指纹一致时零开销跳过）
+        // 学习缓存收编（二期步骤 C，§4.5 读侧）：只影响按需注入集
+        let docsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .standardizedFileURL.path
+        if let base = injectionSet {
+            injectionSet = Self.mergedWithLearned(code: code, base: base, docsPath: docsPath)
+        }
+        var result = await runOnce(code: code, injectionSet: injectionSet,
+                                   onOutput: onOutput, timeout: timeout)
+        // 补漏循环（二期步骤 C，§4.1）：仅在按需注入路径生效——全量模式
+        // （回退/开关关）下 MEMFS 已含全部 included，FN 只能来自「宿主也
+        // 没有」或「排除集文件」，两者都过不了校验链，空转无益
+        if var activeSet = injectionSet {
+            var round = 0
+            var addedByRetries: [String] = []
+            while result.exitCode != 0, round < Self.wsMaxLeakFillRounds {
+                // 判定双源（§4.1，审查二 #2）：exception ∪ stderr 拼接后扫
+                // FN 文本；exitCode ≠ 0 门槛已由循环条件承担（try/except
+                // 捕获后正常退出的无辜脚本不触发重跑）
+                guard let raw = Self.extractMissingFilePath(exception: result.exception,
+                                                            stderr: result.stderr),
+                      let missingRel = Self.normalizeMissingRel(raw, docsPath: docsPath),
+                      let expanded = Self.expandInjectionSet(base: activeSet,
+                                                             missingRel: missingRel,
+                                                             docsPath: docsPath),
+                      !expanded.added.isEmpty else { break }
+                round += 1
+                activeSet = expanded.set
+                addedByRetries.append(contentsOf: expanded.added)
+                let hint = "[pyodide] 缺少文件 \(missingRel)，已补注入（+\(expanded.added.count) 文件）后重跑（副作用会执行两遍）"
+                onOutput?(PyodideOutputLine(text: hint, isStderr: true))
+                AppLog.log("[Pyodide] 补漏第 %{public}ld 轮：%{public}@ → +%{public}ld 文件重跑",
+                       log: Log.pyodide, Int32(round), missingRel, Int32(expanded.added.count))
+                result = await runOnce(code: code, injectionSet: activeSet,
+                                       onOutput: onOutput, timeout: timeout)
+            }
+            // 学习记账（§4.5）：补漏轮重跑收敛（exit 0）才记；两轮仍失败
+            // 的负样本不计（下轮还会补漏尝试，无害）
+            if result.exitCode == 0, !addedByRetries.isEmpty {
+                WorkspaceLearnCache.record(code: code, rels: addedByRetries)
+            }
+        }
+        return result
+    }
+
+    /// 单次执行（首跑与补漏重跑共用：seed → 守卫 → pendingRun）。每次
+    /// attempt 独立 id（outputHandlers/pendingRun 按 id 生命周期，runResult
+    /// 时自动清理）；补漏轮 seed 用扩充集，指纹不一致自动重注入。
+    private func runOnce(code: String, injectionSet: Set<String>?,
+                         onOutput: ((PyodideOutputLine) -> Void)?,
+                         timeout: TimeInterval?) async -> PyodideRunResult {
+        await seedWorkspaceMirror(injectionSet: injectionSet)
         // seed 途中进程死亡兜底（review P1-1）：jetsam 最高发窗口恰是快照
         // 注入本身，此刻本调用尚未进 pendingRun，死亡回调够不到它。若放行，
         // park 后的 evaluate 落在进程重生/未 commit 窗口时 completionHandler
@@ -1098,6 +1310,7 @@ public final class PyodideBridge: NSObject, ObservableObject {
                                     exception: Self.terminatedMessage,
                                     exitCode: -1, durationMs: 0)
         }
+        let id = UUID().uuidString
         if let onOutput { outputHandlers[id] = onOutput }
         ensureWebAttached() // window 就绪晚于 bridge 初始化的场景兜底
         return await withCheckedContinuation { (cont: CheckedContinuation<PyodideRunResult, Never>) in
